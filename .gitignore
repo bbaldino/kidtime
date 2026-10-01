@@ -1,0 +1,6 @@
+/target
+*.db
+*.db-*
+dev/agent.dev.toml
+CLAUDE.local.md
+.env

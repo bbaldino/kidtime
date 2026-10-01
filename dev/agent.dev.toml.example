@@ -1,0 +1,6 @@
+server_url = "http://127.0.0.1:8470"
+token = "dev"
+users = ["parent", "kid1", "kid2"]
+streaming_units = ["sway-sunshine.service"]
+interval_secs = 5   # fast, for testing
+streaming_sway_socket = "/run/user/{uid}/sway-sunshine.sock"

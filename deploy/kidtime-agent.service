@@ -1,0 +1,17 @@
+[Unit]
+Description=Kidtime agent (reports kids' computer usage)
+Wants=network-online.target
+After=network-online.target systemd-logind.service
+
+[Service]
+# Root so it can read every tracked user's processes, desktop files and Steam library
+ExecStart=/usr/local/bin/kidtime-agent --config /etc/kidtime/agent.toml
+Restart=always
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

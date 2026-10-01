@@ -1,0 +1,22 @@
+# /etc/kidtime/agent.toml  (chmod 600: it holds the agent token)
+
+server_url = "http://SERVER-HOST:8470"
+token = "CHANGE-ME"
+
+# Accounts to track
+users = ["kid1", "kid2"]
+
+# How often to sample, in seconds
+# interval_secs = 15
+
+# Reported host name; defaults to the machine's hostname
+# host = "kids-pc"
+
+# systemd user units that run a Sunshine streaming session. Time counts as
+# "streaming" while the user's Sunshine is encoding (a Moonlight client is connected).
+streaming_units = ["sway-sunshine.service"]
+
+# IPC socket of the streaming session's Sway compositor. When set, streamed time
+# goes to the focused window (e.g. a game launched from Battle.net) instead of
+# every app that happens to be running there.
+streaming_sway_socket = "/run/user/{uid}/sway-sunshine.sock"

@@ -1,0 +1,19 @@
+# docker compose up -d --build
+# Put these in a .env file next to this one:
+#   KIDTIME_AGENT_TOKEN=...   (openssl rand -hex 24)
+#   TZ=America/New_York       (the kids' computers' time zone; days are counted in it)
+services:
+  kidtime:
+    build: .
+    image: kidtime-server
+    restart: unless-stopped
+    ports:
+      - "8470:8470"
+    environment:
+      KIDTIME_AGENT_TOKEN: ${KIDTIME_AGENT_TOKEN:?set KIDTIME_AGENT_TOKEN in .env}
+      TZ: ${TZ:?set TZ in .env to the kids' computers' time zone}
+    volumes:
+      - kidtime-data:/data
+
+volumes:
+  kidtime-data:

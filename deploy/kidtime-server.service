@@ -1,0 +1,20 @@
+[Unit]
+Description=Kidtime server (usage store and dashboard)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+DynamicUser=yes
+StateDirectory=kidtime
+# Hands the root-only config (it holds the agent token) to the unprivileged service
+LoadCredential=server.toml:/etc/kidtime/server.toml
+ExecStart=/usr/local/bin/kidtime-server --config ${CREDENTIALS_DIRECTORY}/server.toml
+Restart=always
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

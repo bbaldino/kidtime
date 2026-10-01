@@ -1,0 +1,7 @@
+# /etc/kidtime/server.toml  (chmod 600: it holds the agent token)
+
+listen = "0.0.0.0:8470"
+db = "/var/lib/kidtime/kidtime.db"
+
+# Must match `token` in every agent.toml. Generate one with: openssl rand -hex 24
+agent_token = "CHANGE-ME"
