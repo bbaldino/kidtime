@@ -8,7 +8,7 @@
 
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{Days, Local, NaiveDate, TimeZone};
 use protocol::Report;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -30,7 +30,14 @@ impl Db {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let conn = Connection::open(path)?;
+        // The usual cause in a container: a bind-mounted data directory is created owned by root,
+        // and the server runs as another user.
+        let conn = Connection::open(path).with_context(|| {
+            format!(
+                "is {} writable by the user the server runs as?",
+                path.parent().unwrap_or(path).display()
+            )
+        })?;
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              CREATE TABLE IF NOT EXISTS usage (
