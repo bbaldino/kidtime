@@ -1,0 +1,51 @@
+name: release-please
+
+# One version for the whole repo (version.txt), bumped from conventional
+# commits anywhere in the tree: the server, the agent and the protocol crate
+# ship together. The crate versions in Cargo.toml are not the release version.
+on:
+  push:
+    branches: [main]
+  # Needed to exercise the test gate without breaking main, and to re-run a
+  # stuck release.
+  workflow_dispatch:
+
+# Serialize runs so a post-merge run cannot race the run that spawned it.
+# cancel-in-progress MUST be false: cancelling mid-release can interrupt tag
+# creation.
+concurrency:
+  group: release-please-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    uses: ./.github/workflows/test.yml
+
+  release-please:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: googleapis/release-please-action@v4
+        with:
+          # NOT the default GITHUB_TOKEN: a tag pushed with it does not trigger
+          # publish-image.yml, so the release would silently have no image.
+          token: ${{ secrets.RELEASE_BOT_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+      # No `if:` on purpose. It looks up the release PR by title and exits 0
+      # when there is none, so it retries by itself after a failed merge.
+      # Gating it on the action's `prs_created` output would skip it whenever
+      # the PR was only updated, and releases would silently stop.
+      - name: Auto-merge the release PR
+        env:
+          # Must be RELEASE_BOT_TOKEN: a merge done with GITHUB_TOKEN does not
+          # trigger the follow-up run that cuts the tag.
+          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
+        # --repo is required: this job has no checkout, so gh cannot infer the
+        # repository from a git remote.
+        run: |
+          pr=$(gh pr list --repo "${{ github.repository }}" --state open --json number,title \
+                --jq 'map(select(.title | test("^chore(\\(.+\\))?: release "))) | .[0].number // empty')
+          if [ -z "$pr" ]; then echo "no open release PR"; exit 0; fi
+          gh pr merge --squash --delete-branch --repo "${{ github.repository }}" "$pr"
