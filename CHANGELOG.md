@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1](https://github.com/bbaldino/kidtime/compare/v0.2.0...v0.2.1) (2026-10-02)
+
+
+### Bug Fixes
+
+* **dashboard:** name scripts and styles with a content stamp ([ed6f5fe](https://github.com/bbaldino/kidtime/commit/ed6f5fe29828a53055a14f7705f30c035de8d260))
+
 ## [0.2.0](https://github.com/bbaldino/kidtime/compare/v0.1.1...v0.2.0) (2026-10-02)
 
 
