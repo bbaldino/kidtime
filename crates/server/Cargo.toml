@@ -7,7 +7,9 @@ version.workspace = true
 anyhow = "1.0.104"
 axum = "0.8.9"
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "serde", "std"] }
+jsonwebtoken = { version = "11.1.0", features = ["rust_crypto"] }
 protocol = { version = "0.1.0", path = "../protocol" }
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
@@ -19,3 +21,7 @@ tracing-subscriber = "0.3.23"
 [[bin]]
 name = "kidtime-server"
 path = "src/main.rs"
+
+[dev-dependencies]
+base64 = "0.23.1"
+rsa = "0.9.10"

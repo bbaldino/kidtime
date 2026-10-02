@@ -1,5 +1,6 @@
 //! kidtime-server: collects agent reports and serves the dashboard.
 
+mod auth;
 mod db;
 mod rules;
 
@@ -30,6 +31,12 @@ struct Config {
     /// Shared secret agents must send as a bearer token.
     #[serde(default)]
     agent_token: String,
+    /// Login check: the identity provider's base URL. Set together with `access_aud`.
+    #[serde(default)]
+    access_team: Option<String>,
+    /// Login check: the application's audience tag.
+    #[serde(default)]
+    access_aud: Option<String>,
 }
 
 fn default_listen() -> String {
@@ -45,6 +52,9 @@ struct AppState {
     agent_token: String,
     /// Latest sample from each host, for the live view.
     live: Mutex<HashMap<String, LiveHost>>,
+    /// None when the login check is off.
+    #[allow(dead_code)]
+    auth: Option<Arc<auth::Auth>>,
 }
 
 struct LiveHost {
@@ -68,6 +78,13 @@ async fn main() -> Result<()> {
         }
     }
     let config = load_config(config_path)?;
+    let access = auth::access_config(config.access_team.clone(), config.access_aud.clone())?;
+    if access.is_none() {
+        tracing::warn!(
+            "login check is OFF: anyone who can reach this server can read and change everything"
+        );
+    }
+    let auth = access.map(|c| Arc::new(auth::Auth::new(c)));
 
     let state = Arc::new(AppState {
         db: Mutex::new(
@@ -75,6 +92,7 @@ async fn main() -> Result<()> {
         ),
         agent_token: config.agent_token,
         live: Mutex::new(HashMap::new()),
+        auth,
     });
 
     let app = Router::new()
@@ -120,6 +138,12 @@ fn load_config(path: Option<PathBuf>) -> Result<Config> {
     }
     if let Ok(v) = std::env::var("KIDTIME_AGENT_TOKEN") {
         config.agent_token = v;
+    }
+    if let Ok(v) = std::env::var("KIDTIME_ACCESS_TEAM") {
+        config.access_team = Some(v);
+    }
+    if let Ok(v) = std::env::var("KIDTIME_ACCESS_AUD") {
+        config.access_aud = Some(v);
     }
     if config.agent_token.is_empty() {
         bail!(
