@@ -62,9 +62,11 @@ impl Db {
     pub fn record(&mut self, report: &Report) -> Result<()> {
         let tx = self.conn.transaction()?;
         let last_seq: u64 = tx
-            .query_row("SELECT agent_id, last_seq FROM agents WHERE host = ?1", [&report.host], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
-            })
+            .query_row(
+                "SELECT agent_id, last_seq FROM agents WHERE host = ?1",
+                [&report.host],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64)),
+            )
             .optional()?
             // A new agent id means the agent restarted and its numbering began again
             .filter(|(agent_id, _)| *agent_id == report.agent_id)
@@ -76,16 +78,38 @@ impl Db {
                 "INSERT INTO usage (day, user, host, app_id, app_name, secs) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT (day, user, host, app_id) DO UPDATE SET secs = secs + excluded.secs, app_name = excluded.app_name",
             )?;
-            let mut active = tx.prepare("INSERT INTO activity (user, host, start, end) VALUES (?1, ?2, ?3, ?4)")?;
+            let mut active = tx
+                .prepare("INSERT INTO activity (user, host, start, end) VALUES (?1, ?2, ?3, ?4)")?;
             for sample in report.samples.iter().filter(|s| s.seq > last_seq) {
                 max_seq = max_seq.max(sample.seq);
-                let Some(at) = Local.timestamp_opt(sample.at, 0).single() else { continue };
+                let Some(at) = Local.timestamp_opt(sample.at, 0).single() else {
+                    continue;
+                };
                 let day = at.date_naive().to_string();
                 for user in sample.users.iter().filter(|u| u.state.counts()) {
-                    active.execute(params![user.user, report.host, sample.at - i64::from(sample.elapsed_secs), sample.at])?;
-                    add.execute(params![day, user.user, report.host, TOTAL, "", sample.elapsed_secs])?;
+                    active.execute(params![
+                        user.user,
+                        report.host,
+                        sample.at - i64::from(sample.elapsed_secs),
+                        sample.at
+                    ])?;
+                    add.execute(params![
+                        day,
+                        user.user,
+                        report.host,
+                        TOTAL,
+                        "",
+                        sample.elapsed_secs
+                    ])?;
                     for app in &user.apps {
-                        add.execute(params![day, user.user, report.host, app.id, app.name, sample.elapsed_secs])?;
+                        add.execute(params![
+                            day,
+                            user.user,
+                            report.host,
+                            app.id,
+                            app.name,
+                            sample.elapsed_secs
+                        ])?;
                     }
                 }
             }
@@ -101,20 +125,31 @@ impl Db {
 
     /// Users with any usage since `since`.
     pub fn users_since(&self, since: NaiveDate) -> Result<Vec<String>> {
-        let mut stmt = self.conn.prepare("SELECT DISTINCT user FROM usage WHERE day >= ?1")?;
-        let users = stmt.query_map([since.to_string()], |r| r.get(0))?.collect::<Result<_, _>>()?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT user FROM usage WHERE day >= ?1")?;
+        let users = stmt
+            .query_map([since.to_string()], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
         Ok(users)
     }
 
     /// Seconds per day the user was active on any machine, for days in `from..=to`, oldest first.
-    pub fn daily_totals(&self, user: &str, from: NaiveDate, to: NaiveDate) -> Result<Vec<(NaiveDate, i64)>> {
+    pub fn daily_totals(
+        &self,
+        user: &str,
+        from: NaiveDate,
+        to: NaiveDate,
+    ) -> Result<Vec<(NaiveDate, i64)>> {
         let range_start = midnight(from);
         let range_end = midnight(to + Days::new(1));
         let mut stmt = self.conn.prepare(
             "SELECT start, end FROM activity WHERE user = ?1 AND end > ?2 AND start < ?3 ORDER BY start",
         )?;
         let intervals: Vec<(i64, i64)> = stmt
-            .query_map(params![user, range_start, range_end], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .query_map(params![user, range_start, range_end], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?
             .collect::<Result<_, _>>()?;
         let merged = merge(intervals);
 
@@ -122,7 +157,10 @@ impl Db {
         let mut day = from;
         while day <= to {
             let (start, end) = (midnight(day), midnight(day + Days::new(1)));
-            let secs = merged.iter().map(|&(s, e)| (e.min(end) - s.max(start)).max(0)).sum();
+            let secs = merged
+                .iter()
+                .map(|&(s, e)| (e.min(end) - s.max(start)).max(0))
+                .sum();
             totals.push((day, secs));
             day = day + Days::new(1);
         }
@@ -135,7 +173,9 @@ impl Db {
             "SELECT host, secs FROM usage WHERE user = ?1 AND app_id = ?2 AND day = ?3 ORDER BY secs DESC",
         )?;
         let rows = stmt
-            .query_map(params![user, TOTAL, day.to_string()], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .query_map(params![user, TOTAL, day.to_string()], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?
             .collect::<Result<_, _>>()?;
         Ok(rows)
     }
@@ -147,7 +187,12 @@ impl Db {
              GROUP BY app_id ORDER BY total DESC",
         )?;
         let rows = stmt
-            .query_map(params![user, TOTAL, day.to_string()], |r| Ok(AppUsage { name: r.get(0)?, secs: r.get(1)? }))?
+            .query_map(params![user, TOTAL, day.to_string()], |r| {
+                Ok(AppUsage {
+                    name: r.get(0)?,
+                    secs: r.get(1)?,
+                })
+            })?
             .collect::<Result<_, _>>()?;
         Ok(rows)
     }
@@ -202,7 +247,10 @@ mod tests {
                     users: vec![UserSample {
                         user: "kid1".into(),
                         state,
-                        apps: vec![App { id: "steam:1".into(), name: "Minecraft".into() }],
+                        apps: vec![App {
+                            id: "steam:1".into(),
+                            name: "Minecraft".into(),
+                        }],
                     }],
                 })
                 .collect(),
@@ -225,7 +273,14 @@ mod tests {
         db.record(&report("a", &[4], UserState::Idle)).unwrap();
         assert_eq!(total(&db), 45);
         // After a restart the agent numbers from 1 again
-        db.record(&report_from("pc", "b", &[1], UserState::Streaming, start_of_test() + 600)).unwrap();
+        db.record(&report_from(
+            "pc",
+            "b",
+            &[1],
+            UserState::Streaming,
+            start_of_test() + 600,
+        ))
+        .unwrap();
         assert_eq!(total(&db), 60);
         assert_eq!(db.app_totals("kid1", today).unwrap()[0].secs, 60);
 
@@ -234,17 +289,39 @@ mod tests {
 
     #[test]
     fn overlapping_hosts_count_once() {
-        let path = std::env::temp_dir().join(format!("kidtime-test-overlap-{}.db", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("kidtime-test-overlap-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let mut db = Db::open(&path).unwrap();
         let today = Local::now().date_naive();
 
         // A kid streams: the host sees a stream and the client PC sees an active desktop, for the same minute
-        db.record(&report_from("host-a", "a", &[1, 2, 3, 4], UserState::Streaming, start_of_test())).unwrap();
-        db.record(&report_from("host-b", "b", &[1, 2, 3, 4], UserState::Active, start_of_test())).unwrap();
+        db.record(&report_from(
+            "host-a",
+            "a",
+            &[1, 2, 3, 4],
+            UserState::Streaming,
+            start_of_test(),
+        ))
+        .unwrap();
+        db.record(&report_from(
+            "host-b",
+            "b",
+            &[1, 2, 3, 4],
+            UserState::Active,
+            start_of_test(),
+        ))
+        .unwrap();
         assert_eq!(db.daily_totals("kid1", today, today).unwrap()[0].1, 60);
         // Each computer still shows its own time
-        assert_eq!(db.host_totals("kid1", today).unwrap().iter().map(|h| h.1).sum::<i64>(), 120);
+        assert_eq!(
+            db.host_totals("kid1", today)
+                .unwrap()
+                .iter()
+                .map(|h| h.1)
+                .sum::<i64>(),
+            120
+        );
 
         std::fs::remove_file(&path).unwrap();
     }

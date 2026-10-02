@@ -13,13 +13,19 @@ trait Manager {
     fn get_user(&self, uid: u32) -> zbus::Result<OwnedObjectPath>;
 }
 
-#[zbus::proxy(interface = "org.freedesktop.login1.User", default_service = "org.freedesktop.login1")]
+#[zbus::proxy(
+    interface = "org.freedesktop.login1.User",
+    default_service = "org.freedesktop.login1"
+)]
 trait User {
     #[zbus(property)]
     fn sessions(&self) -> zbus::Result<Vec<(String, OwnedObjectPath)>>;
 }
 
-#[zbus::proxy(interface = "org.freedesktop.login1.Session", default_service = "org.freedesktop.login1")]
+#[zbus::proxy(
+    interface = "org.freedesktop.login1.Session",
+    default_service = "org.freedesktop.login1"
+)]
 trait Session {
     #[zbus(property, name = "Type")]
     fn session_type(&self) -> zbus::Result<String>;
@@ -41,7 +47,9 @@ pub struct Logind {
 
 impl Logind {
     pub async fn connect() -> zbus::Result<Self> {
-        Ok(Self { conn: zbus::Connection::system().await? })
+        Ok(Self {
+            conn: zbus::Connection::system().await?,
+        })
     }
 
     /// Current state of the user's graphical sessions.
@@ -65,7 +73,9 @@ impl Logind {
                 .build()
                 .await?;
             // Sessions can disappear between listing and querying; skip those
-            let Ok(kind) = session.session_type().await else { continue };
+            let Ok(kind) = session.session_type().await else {
+                continue;
+            };
             if !GRAPHICAL_TYPES.contains(&kind.as_str()) || session.class().await? != "user" {
                 continue;
             }

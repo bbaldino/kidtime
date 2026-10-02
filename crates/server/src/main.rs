@@ -60,14 +60,18 @@ async fn main() -> Result<()> {
     let mut config_path = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--config" => config_path = Some(PathBuf::from(args.next().context("--config needs a path")?)),
+            "--config" => {
+                config_path = Some(PathBuf::from(args.next().context("--config needs a path")?))
+            }
             other => bail!("unknown argument: {other}"),
         }
     }
     let config = load_config(config_path)?;
 
     let state = Arc::new(AppState {
-        db: Mutex::new(db::Db::open(&config.db).with_context(|| format!("opening {}", config.db.display()))?),
+        db: Mutex::new(
+            db::Db::open(&config.db).with_context(|| format!("opening {}", config.db.display()))?,
+        ),
         agent_token: config.agent_token,
         live: Mutex::new(HashMap::new()),
     });
@@ -77,12 +81,19 @@ async fn main() -> Result<()> {
         .route("/api/report", post(report))
         .route("/api/status", get(status))
         .route("/", get(|| asset("index.html")))
-        .route("/{file}", get(|axum::extract::Path(file): axum::extract::Path<String>| asset_owned(file)))
+        .route(
+            "/{file}",
+            get(|axum::extract::Path(file): axum::extract::Path<String>| asset_owned(file)),
+        )
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind(&config.listen).await.with_context(|| format!("binding {}", config.listen))?;
+    let listener = tokio::net::TcpListener::bind(&config.listen)
+        .await
+        .with_context(|| format!("binding {}", config.listen))?;
     tracing::info!("listening on {}", config.listen);
-    axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
     Ok(())
 }
 
@@ -97,7 +108,8 @@ fn load_config(path: Option<PathBuf>) -> Result<Config> {
         Err(e) if !required && e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
-    let mut config: Config = toml::from_str(&contents).with_context(|| format!("parsing {}", path.display()))?;
+    let mut config: Config =
+        toml::from_str(&contents).with_context(|| format!("parsing {}", path.display()))?;
 
     if let Ok(v) = std::env::var("KIDTIME_LISTEN") {
         config.listen = v;
@@ -109,14 +121,18 @@ fn load_config(path: Option<PathBuf>) -> Result<Config> {
         config.agent_token = v;
     }
     if config.agent_token.is_empty() {
-        bail!("no agent token: set agent_token in {} or KIDTIME_AGENT_TOKEN", path.display());
+        bail!(
+            "no agent token: set agent_token in {} or KIDTIME_AGENT_TOKEN",
+            path.display()
+        );
     }
     Ok(config)
 }
 
 /// Ctrl+C, or SIGTERM from systemd / `docker stop`.
 async fn shutdown_signal() {
-    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("SIGTERM handler");
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("SIGTERM handler");
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}
         _ = term.recv() => {}
@@ -128,7 +144,11 @@ fn now() -> i64 {
     Local::now().timestamp()
 }
 
-async fn report(State(state): State<Arc<AppState>>, headers: HeaderMap, Json(report): Json<Report>) -> Response {
+async fn report(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(report): Json<Report>,
+) -> Response {
     let authorized = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -145,7 +165,11 @@ async fn report(State(state): State<Arc<AppState>>, headers: HeaderMap, Json(rep
     if let Some(latest) = report.samples.last() {
         state.live.lock().unwrap().insert(
             report.host.clone(),
-            LiveHost { received_at: now(), interval_secs: report.interval_secs, users: latest.users.clone() },
+            LiveHost {
+                received_at: now(),
+                interval_secs: report.interval_secs,
+                users: latest.users.clone(),
+            },
         );
     }
     StatusCode::NO_CONTENT.into_response()
@@ -214,7 +238,14 @@ async fn status(State(state): State<Arc<AppState>>) -> Result<Json<Status>, Stat
             } else {
                 (u.state, u.apps.iter().map(|a| a.name.clone()).collect())
             };
-            sessions.entry(u.user.clone()).or_default().push(HostSession { host: host.clone(), state, apps });
+            sessions
+                .entry(u.user.clone())
+                .or_default()
+                .push(HostSession {
+                    host: host.clone(),
+                    state,
+                    apps,
+                });
         }
     }
 
@@ -231,17 +262,26 @@ async fn status(State(state): State<Arc<AppState>>) -> Result<Json<Status>, Stat
     let mut users = Vec::new();
     for name in names {
         let mut user_sessions = sessions.remove(&name).unwrap_or_default();
-        user_sessions.sort_by(|a, b| presence(b.state).cmp(&presence(a.state)).then(a.host.cmp(&b.host)));
+        user_sessions.sort_by(|a, b| {
+            presence(b.state)
+                .cmp(&presence(a.state))
+                .then(a.host.cmp(&b.host))
+        });
         let (state, host) = user_sessions
             .first()
             .filter(|s| s.state != UserState::Offline)
-            .map_or((UserState::Offline, None), |s| (s.state, Some(s.host.clone())));
+            .map_or((UserState::Offline, None), |s| {
+                (s.state, Some(s.host.clone()))
+            });
 
         let days: Vec<NamedSecs> = db
             .daily_totals(&name, first_day, today)
             .map_err(internal)?
             .into_iter()
-            .map(|(day, secs)| NamedSecs { name: day.to_string(), secs })
+            .map(|(day, secs)| NamedSecs {
+                name: day.to_string(),
+                secs,
+            })
             .collect();
 
         users.push(UserStatus {
@@ -253,7 +293,10 @@ async fn status(State(state): State<Arc<AppState>>) -> Result<Json<Status>, Stat
                 .app_totals(&name, today)
                 .map_err(internal)?
                 .into_iter()
-                .map(|a| NamedSecs { name: a.name, secs: a.secs })
+                .map(|a| NamedSecs {
+                    name: a.name,
+                    secs: a.secs,
+                })
                 .collect(),
             hosts_today: db
                 .host_totals(&name, today)
@@ -266,7 +309,10 @@ async fn status(State(state): State<Arc<AppState>>) -> Result<Json<Status>, Stat
             user: name,
         });
     }
-    Ok(Json(Status { generated_at: now, users }))
+    Ok(Json(Status {
+        generated_at: now,
+        users,
+    }))
 }
 
 async fn asset_owned(file: String) -> Response {
@@ -275,17 +321,42 @@ async fn asset_owned(file: String) -> Response {
 
 async fn asset(file: &str) -> Response {
     let (body, content_type): (&'static [u8], &str) = match file {
-        "index.html" => (include_bytes!("../static/index.html"), "text/html; charset=utf-8"),
-        "app.js" => (include_bytes!("../static/app.js"), "text/javascript; charset=utf-8"),
-        "style.css" => (include_bytes!("../static/style.css"), "text/css; charset=utf-8"),
-        "sw.js" => (include_bytes!("../static/sw.js"), "text/javascript; charset=utf-8"),
-        "manifest.webmanifest" => (include_bytes!("../static/manifest.webmanifest"), "application/manifest+json"),
+        "index.html" => (
+            include_bytes!("../static/index.html"),
+            "text/html; charset=utf-8",
+        ),
+        "app.js" => (
+            include_bytes!("../static/app.js"),
+            "text/javascript; charset=utf-8",
+        ),
+        "style.css" => (
+            include_bytes!("../static/style.css"),
+            "text/css; charset=utf-8",
+        ),
+        "sw.js" => (
+            include_bytes!("../static/sw.js"),
+            "text/javascript; charset=utf-8",
+        ),
+        "manifest.webmanifest" => (
+            include_bytes!("../static/manifest.webmanifest"),
+            "application/manifest+json",
+        ),
         "icon.svg" => (include_bytes!("../static/icon.svg"), "image/svg+xml"),
         "icon-192.png" => (include_bytes!("../static/icon-192.png"), "image/png"),
         "icon-512.png" => (include_bytes!("../static/icon-512.png"), "image/png"),
-        "apple-touch-icon.png" => (include_bytes!("../static/apple-touch-icon.png"), "image/png"),
+        "apple-touch-icon.png" => (
+            include_bytes!("../static/apple-touch-icon.png"),
+            "image/png",
+        ),
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
     // Revalidate everything; the service worker handles offline use
-    ([(header::CONTENT_TYPE, content_type), (header::CACHE_CONTROL, "no-cache")], body).into_response()
+    (
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        body,
+    )
+        .into_response()
 }

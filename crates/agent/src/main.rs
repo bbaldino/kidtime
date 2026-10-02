@@ -64,12 +64,15 @@ async fn main() -> Result<()> {
     }
 
     let config: Config = toml::from_str(
-        &std::fs::read_to_string(&config_path).with_context(|| format!("reading {}", config_path.display()))?,
+        &std::fs::read_to_string(&config_path)
+            .with_context(|| format!("reading {}", config_path.display()))?,
     )
     .with_context(|| format!("parsing {}", config_path.display()))?;
     let host = match &config.host {
         Some(h) => h.clone(),
-        None => std::fs::read_to_string("/proc/sys/kernel/hostname")?.trim().to_string(),
+        None => std::fs::read_to_string("/proc/sys/kernel/hostname")?
+            .trim()
+            .to_string(),
     };
     let users = config
         .users
@@ -77,7 +80,9 @@ async fn main() -> Result<()> {
         .map(|name| lookup_user(name))
         .collect::<Result<Vec<_>>>()?;
 
-    let logind = logind::Logind::connect().await.context("connecting to logind")?;
+    let logind = logind::Logind::connect()
+        .await
+        .context("connecting to logind")?;
     let mut scanner = apps::Scanner::default();
     let mut streams = sunshine::Monitor::default();
 
@@ -90,12 +95,20 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let agent_id = std::fs::read_to_string("/proc/sys/kernel/random/uuid")?.trim().to_string();
-    let client = reqwest::Client::builder().timeout(Duration::from_secs(10)).build()?;
+    let agent_id = std::fs::read_to_string("/proc/sys/kernel/random/uuid")?
+        .trim()
+        .to_string();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
     let report_url = format!("{}/api/report", config.server_url.trim_end_matches('/'));
     let interval = Duration::from_secs(config.interval_secs.into());
 
-    tracing::info!("{host}: tracking {} every {}s, reporting to {report_url}", config.users.join(", "), config.interval_secs);
+    tracing::info!(
+        "{host}: tracking {} every {}s, reporting to {report_url}",
+        config.users.join(", "),
+        config.interval_secs
+    );
 
     let mut pending: VecDeque<Sample> = VecDeque::new();
     let mut ticker = tokio::time::interval(interval);
@@ -119,7 +132,18 @@ async fn main() -> Result<()> {
             scanner.clear_caches();
         }
 
-        pending.push_back(take_sample(&logind, &mut scanner, &mut streams, &users, &config, seq, elapsed).await);
+        pending.push_back(
+            take_sample(
+                &logind,
+                &mut scanner,
+                &mut streams,
+                &users,
+                &config,
+                seq,
+                elapsed,
+            )
+            .await,
+        );
         while pending.len() > MAX_PENDING {
             pending.pop_front();
         }
@@ -127,7 +151,12 @@ async fn main() -> Result<()> {
         while !pending.is_empty() {
             let batch: Vec<Sample> = pending.iter().take(MAX_BATCH).cloned().collect();
             let sent = batch.len();
-            let report = Report { host: host.clone(), agent_id: agent_id.clone(), interval_secs: config.interval_secs, samples: batch };
+            let report = Report {
+                host: host.clone(),
+                agent_id: agent_id.clone(),
+                interval_secs: config.interval_secs,
+                samples: batch,
+            };
             let result = client
                 .post(&report_url)
                 .bearer_auth(&config.token)
@@ -165,30 +194,57 @@ async fn take_sample(
         });
         let found = scanner.scan(user.uid, &user.home, &config.streaming_units);
         // Checked every tick (not only when needed) so there's always a previous reading to compare with
-        let stream = if config.streaming_units.is_empty() { sunshine::Stream::Unknown } else { streams.check(user.uid) };
-        let game_open = found.streamed_apps.iter().any(|a| a.id.starts_with("steam:"));
+        let stream = if config.streaming_units.is_empty() {
+            sunshine::Stream::Unknown
+        } else {
+            streams.check(user.uid)
+        };
+        let game_open = found
+            .streamed_apps
+            .iter()
+            .any(|a| a.id.starts_with("steam:"));
         let anything_open = !found.streamed_apps.is_empty();
         // What's on the stream: the focused window when Sway can tell us, otherwise whatever is running
         let streamed_apps = config
             .streaming_sway_socket
             .as_ref()
-            .and_then(|pattern| sway::focused_window(Path::new(&pattern.replace("{uid}", &user.uid.to_string()))))
-            .map(|window| vec![sway::app_for(&window, |appid| scanner.steam_name(user.uid, &user.home, appid, ""))])
+            .and_then(|pattern| {
+                sway::focused_window(Path::new(&pattern.replace("{uid}", &user.uid.to_string())))
+            })
+            .map(|window| {
+                vec![sway::app_for(&window, |appid| {
+                    scanner.steam_name(user.uid, &user.home, appid, "")
+                })]
+            })
             .unwrap_or(found.streamed_apps);
         let (state, apps) = match stream {
             _ if state.counts() => (state, found.apps),
             // Anything being streamed counts, even just the Steam menus
             sunshine::Stream::Connected => (UserState::Streaming, streamed_apps),
             // Something open over there, but nobody's watching
-            sunshine::Stream::Disconnected if anything_open => (UserState::StreamIdle, streamed_apps),
+            sunshine::Stream::Disconnected if anything_open => {
+                (UserState::StreamIdle, streamed_apps)
+            }
             // Encoder can't be checked: count games rather than miss real play
             sunshine::Stream::Unknown if game_open => (UserState::Streaming, streamed_apps),
             _ => (state, found.apps),
         };
-        samples.push(UserSample { user: user.name.clone(), state, apps });
+        samples.push(UserSample {
+            user: user.name.clone(),
+            state,
+            apps,
+        });
     }
-    let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
-    Sample { seq, at, elapsed_secs, users: samples }
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    Sample {
+        seq,
+        at,
+        elapsed_secs,
+        users: samples,
+    }
 }
 
 fn lookup_user(name: &str) -> Result<TrackedUser> {
@@ -197,6 +253,10 @@ fn lookup_user(name: &str) -> Result<TrackedUser> {
         .lines()
         .map(|l| l.split(':').collect::<Vec<_>>())
         .find(|f| f.len() >= 6 && f[0] == name)
-        .map(|f| TrackedUser { name: name.to_string(), uid: f[2].parse().unwrap_or(u32::MAX), home: Path::new(f[5]).to_path_buf() })
+        .map(|f| TrackedUser {
+            name: name.to_string(),
+            uid: f[2].parse().unwrap_or(u32::MAX),
+            home: Path::new(f[5]).to_path_buf(),
+        })
         .with_context(|| format!("user {name} not found in /etc/passwd"))
 }

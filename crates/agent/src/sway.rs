@@ -23,20 +23,35 @@ pub struct Window {
 
 /// The focused window, if Sway is reachable and a titled window has focus.
 pub fn focused_window(socket: &Path) -> Option<Window> {
-    let tree = get_tree(socket).map_err(|e| tracing::debug!("sway {}: {e}", socket.display())).ok()?;
+    let tree = get_tree(socket)
+        .map_err(|e| tracing::debug!("sway {}: {e}", socket.display()))
+        .ok()?;
     find_focused(&tree)
 }
 
 /// What to attribute time in `window` to.
 pub fn app_for(window: &Window, steam_name: impl FnOnce(u32) -> String) -> App {
     if window.class == "steam" {
-        return App { id: "steam".into(), name: "Steam".into() };
+        return App {
+            id: "steam".into(),
+            name: "Steam".into(),
+        };
     }
     // Proton names windows after the Steam app id, except for non-Steam shortcuts (steam_app_default)
-    if let Some(appid) = window.class.strip_prefix("steam_app_").and_then(|id| id.parse().ok()) {
-        return App { id: format!("steam:{appid}"), name: steam_name(appid) };
+    if let Some(appid) = window
+        .class
+        .strip_prefix("steam_app_")
+        .and_then(|id| id.parse().ok())
+    {
+        return App {
+            id: format!("steam:{appid}"),
+            name: steam_name(appid),
+        };
     }
-    App { id: format!("window:{}", window.title), name: window.title.clone() }
+    App {
+        id: format!("window:{}", window.title),
+        name: window.title.clone(),
+    }
 }
 
 fn get_tree(socket: &Path) -> std::io::Result<Value> {
@@ -70,7 +85,10 @@ fn find_focused(node: &Value) -> Option<Window> {
             .as_str()
             .or_else(|| node["window_properties"]["class"].as_str())
             .unwrap_or_default();
-        return Some(Window { class: class.to_string(), title: title.to_string() });
+        return Some(Window {
+            class: class.to_string(),
+            title: title.to_string(),
+        });
     }
     ["nodes", "floating_nodes"]
         .iter()
@@ -96,7 +114,10 @@ mod tests {
         let window = find_focused(&tree).unwrap();
         assert_eq!(window.title, "Heroes of the Storm");
         let app = app_for(&window, |_| unreachable!());
-        assert_eq!((app.id.as_str(), app.name.as_str()), ("window:Heroes of the Storm", "Heroes of the Storm"));
+        assert_eq!(
+            (app.id.as_str(), app.name.as_str()),
+            ("window:Heroes of the Storm", "Heroes of the Storm")
+        );
     }
 
     #[test]
@@ -108,10 +129,19 @@ mod tests {
 
     #[test]
     fn steam_windows() {
-        let steam = Window { class: "steam".into(), title: "Steam Big Picture Mode".into() };
+        let steam = Window {
+            class: "steam".into(),
+            title: "Steam Big Picture Mode".into(),
+        };
         assert_eq!(app_for(&steam, |_| unreachable!()).id, "steam");
-        let game = Window { class: "steam_app_1240440".into(), title: "Halo".into() };
+        let game = Window {
+            class: "steam_app_1240440".into(),
+            title: "Halo".into(),
+        };
         let app = app_for(&game, |id| format!("game {id}"));
-        assert_eq!((app.id.as_str(), app.name.as_str()), ("steam:1240440", "game 1240440"));
+        assert_eq!(
+            (app.id.as_str(), app.name.as_str()),
+            ("steam:1240440", "game 1240440")
+        );
     }
 }

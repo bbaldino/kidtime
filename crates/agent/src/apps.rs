@@ -36,11 +36,16 @@ impl Scanner {
     }
 
     pub fn scan(&mut self, uid: u32, home: &Path, streaming_units: &[String]) -> UserApps {
-        let mut result = UserApps { apps: Vec::new(), streamed_apps: Vec::new() };
+        let mut result = UserApps {
+            apps: Vec::new(),
+            streamed_apps: Vec::new(),
+        };
         let root = PathBuf::from(format!("/sys/fs/cgroup/user.slice/user-{uid}.slice"));
         let mut stack = vec![root];
         while let Some(dir) = stack.pop() {
-            let Ok(entries) = fs::read_dir(&dir) else { continue };
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
             for entry in entries.flatten() {
                 if entry.file_type().is_ok_and(|t| t.is_dir()) {
                     stack.push(entry.path());
@@ -62,14 +67,23 @@ impl Scanner {
                 .any(|c| streaming_units.iter().any(|u| c.as_os_str() == u.as_str()));
             for pid in pids {
                 if let Some((appid, program)) = steam_game(pid) {
-                    let game = App { id: format!("steam:{appid}"), name: self.steam_name(uid, home, appid, &program) };
+                    let game = App {
+                        id: format!("steam:{appid}"),
+                        name: self.steam_name(uid, home, appid, &program),
+                    };
                     if streaming {
                         push_unique(&mut result.streamed_apps, game.clone());
                     }
                     push_unique(&mut result.apps, game);
                 } else if streaming && is_steam_client(pid) {
                     // Desktop sessions get Steam from its app scope; streaming sessions have none
-                    push_unique(&mut result.streamed_apps, App { id: "steam".into(), name: "Steam".into() });
+                    push_unique(
+                        &mut result.streamed_apps,
+                        App {
+                            id: "steam".into(),
+                            name: "Steam".into(),
+                        },
+                    );
                 }
             }
         }
@@ -98,18 +112,30 @@ impl Scanner {
                     .iter()
                     .find_map(|lib| {
                         let manifest = lib.join(format!("steamapps/appmanifest_{appid}.acf"));
-                        vdf_values(&fs::read_to_string(manifest).ok()?, "name").into_iter().next()
+                        vdf_values(&fs::read_to_string(manifest).ok()?, "name")
+                            .into_iter()
+                            .next()
                     })
                     // Non-Steam games added to the library live in shortcuts.vdf instead
                     .or_else(|| {
                         libraries.iter().take(2).find_map(|root| {
-                            fs::read_dir(root.join("userdata")).ok()?.flatten().find_map(|account| {
-                                let vdf = fs::read(account.path().join("config/shortcuts.vdf")).ok()?;
-                                shortcut_name(&vdf, appid)
-                            })
+                            fs::read_dir(root.join("userdata"))
+                                .ok()?
+                                .flatten()
+                                .find_map(|account| {
+                                    let vdf = fs::read(account.path().join("config/shortcuts.vdf"))
+                                        .ok()?;
+                                    shortcut_name(&vdf, appid)
+                                })
                         })
                     })
-                    .unwrap_or_else(|| if program.is_empty() { format!("Steam game {appid}") } else { program.to_string() })
+                    .unwrap_or_else(|| {
+                        if program.is_empty() {
+                            format!("Steam game {appid}")
+                        } else {
+                            program.to_string()
+                        }
+                    })
             })
             .clone()
     }
@@ -148,7 +174,10 @@ fn unescape(s: &str) -> String {
     let mut rest = s;
     while let Some(i) = rest.find("\\x") {
         out.push_str(&rest[..i]);
-        match rest.get(i + 2..i + 4).and_then(|h| u8::from_str_radix(h, 16).ok()) {
+        match rest
+            .get(i + 2..i + 4)
+            .and_then(|h| u8::from_str_radix(h, 16).ok())
+        {
             Some(b) => {
                 out.push(b as char);
                 rest = &rest[i + 4..];
@@ -200,11 +229,17 @@ fn parse_desktop_entry(contents: &str) -> Option<String> {
 /// Returns the app id and the launched program's file name.
 fn steam_game(pid: u32) -> Option<(u32, String)> {
     let cmdline = fs::read(format!("/proc/{pid}/cmdline")).ok()?;
-    let args: Vec<String> = cmdline.split(|&b| b == 0).map(|a| String::from_utf8_lossy(a).into_owned()).collect();
+    let args: Vec<String> = cmdline
+        .split(|&b| b == 0)
+        .map(|a| String::from_utf8_lossy(a).into_owned())
+        .collect();
     if !args.iter().any(|a| a == "SteamLaunch") {
         return None;
     }
-    let appid = args.iter().find_map(|a| a.strip_prefix("AppId=")?.parse().ok()).filter(|&id| id != 0)?;
+    let appid = args
+        .iter()
+        .find_map(|a| a.strip_prefix("AppId=")?.parse().ok())
+        .filter(|&id| id != 0)?;
     let program = args
         .iter()
         .skip_while(|a| *a != "--")
@@ -224,7 +259,10 @@ fn shortcut_name(vdf: &[u8], appid: u32) -> Option<String> {
     let needle: Vec<u8> = [b"\x02appid\0".as_slice(), &appid.to_le_bytes()].concat();
     let start = vdf.windows(needle.len()).position(|w| w == needle)? + needle.len();
     let rest = &vdf[start..];
-    let key_end = rest.windows(9).position(|w| w.eq_ignore_ascii_case(b"\x01appname\0"))? + 9;
+    let key_end = rest
+        .windows(9)
+        .position(|w| w.eq_ignore_ascii_case(b"\x01appname\0"))?
+        + 9;
     let name = &rest[key_end..];
     let len = name.iter().position(|&b| b == 0)?;
     Some(String::from_utf8_lossy(&name[..len]).into_owned())
@@ -247,7 +285,14 @@ fn vdf_values(contents: &str, key: &str) -> Vec<String> {
     contents
         .lines()
         .filter_map(|l| l.trim().strip_prefix(&quoted_key))
-        .filter_map(|v| Some(v.trim().strip_prefix('"')?.strip_suffix('"')?.replace("\\\\", "\\")))
+        .filter_map(|v| {
+            Some(
+                v.trim()
+                    .strip_prefix('"')?
+                    .strip_suffix('"')?
+                    .replace("\\\\", "\\"),
+            )
+        })
         .collect()
 }
 
@@ -257,32 +302,57 @@ mod tests {
 
     #[test]
     fn scope_names() {
-        assert_eq!(parse_app_scope("app-gnome-org.freecad.FreeCAD-2058620.scope").as_deref(), Some("org.freecad.FreeCAD"));
-        assert_eq!(parse_app_scope("app-gnome-google\\x2dchrome-145676.scope").as_deref(), Some("google-chrome"));
-        assert_eq!(parse_app_scope("app-flatpak-com.bambulab.BambuStudio-4090952777.scope").as_deref(), Some("com.bambulab.BambuStudio"));
-        assert_eq!(parse_app_scope("app-com.google.Chrome-145676.scope").as_deref(), Some("com.google.Chrome"));
-        assert_eq!(parse_app_scope("app-gnome-Example\\x20Background\\x20Service-35722.scope").as_deref(), Some("Example Background Service"));
+        assert_eq!(
+            parse_app_scope("app-gnome-org.freecad.FreeCAD-2058620.scope").as_deref(),
+            Some("org.freecad.FreeCAD")
+        );
+        assert_eq!(
+            parse_app_scope("app-gnome-google\\x2dchrome-145676.scope").as_deref(),
+            Some("google-chrome")
+        );
+        assert_eq!(
+            parse_app_scope("app-flatpak-com.bambulab.BambuStudio-4090952777.scope").as_deref(),
+            Some("com.bambulab.BambuStudio")
+        );
+        assert_eq!(
+            parse_app_scope("app-com.google.Chrome-145676.scope").as_deref(),
+            Some("com.google.Chrome")
+        );
+        assert_eq!(
+            parse_app_scope("app-gnome-Example\\x20Background\\x20Service-35722.scope").as_deref(),
+            Some("Example Background Service")
+        );
         assert_eq!(parse_app_scope("sway-sunshine.service"), None);
-        assert_eq!(parse_app_scope("app-dbus\\x2d:1.5\\x2dorg.a11y.atspi.Registry.slice"), None);
+        assert_eq!(
+            parse_app_scope("app-dbus\\x2d:1.5\\x2dorg.a11y.atspi.Registry.slice"),
+            None
+        );
     }
 
     #[test]
     fn desktop_entries() {
         let entry = "[Desktop Entry]\nName=FreeCAD\nName[de]=FreeCAD DE\nExec=freecad\n[Desktop Action New]\nName=New\n";
         assert_eq!(parse_desktop_entry(entry).as_deref(), Some("FreeCAD"));
-        assert_eq!(parse_desktop_entry("[Desktop Entry]\nName=Chrome\nNoDisplay=true\n"), None);
+        assert_eq!(
+            parse_desktop_entry("[Desktop Entry]\nName=Chrome\nNoDisplay=true\n"),
+            None
+        );
     }
 
     #[test]
     fn shortcuts() {
         let vdf = b"\0shortcuts\0\x000\0\x02appid\0\x1e\x8f\xf0\x98\x01AppName\0Battle.net-Setup.exe\0\x01Exe\0x\0\x08\x08";
-        assert_eq!(shortcut_name(vdf, 0x98f08f1e).as_deref(), Some("Battle.net-Setup.exe"));
+        assert_eq!(
+            shortcut_name(vdf, 0x98f08f1e).as_deref(),
+            Some("Battle.net-Setup.exe")
+        );
         assert_eq!(shortcut_name(vdf, 1), None);
     }
 
     #[test]
     fn vdf() {
-        let acf = "\"AppState\"\n{\n\t\"appid\"\t\t\"1091500\"\n\t\"name\"\t\t\"Cyberpunk 2077\"\n}";
+        let acf =
+            "\"AppState\"\n{\n\t\"appid\"\t\t\"1091500\"\n\t\"name\"\t\t\"Cyberpunk 2077\"\n}";
         assert_eq!(vdf_values(acf, "name"), vec!["Cyberpunk 2077"]);
     }
 }
