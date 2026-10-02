@@ -110,8 +110,9 @@ session.
 
 ## The would-have log
 
-Whenever a report is recorded, the server computes the decision for each account in it and compares it
-with the last one logged for that account. If `computer` or any "used up" flag differs, it inserts an
+Whenever a report is recorded, the server computes the decision for each account that is in use in that
+report (state `active` or `streaming` in its latest sample) and compares it with the last one logged for
+that account. If `computer` or any "used up" flag differs, it inserts an
 event: account, time, what changed, and the reason. Events are shown newest first and kept for 30 days.
 
 Wording describes what would happen, because nothing is enforced yet: "Would have locked: outside

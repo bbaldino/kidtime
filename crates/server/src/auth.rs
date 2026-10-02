@@ -3,7 +3,7 @@
 //! Only the signature is trusted. Plain identity headers are ignored, because the server can also be
 //! reached without going through the proxy.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
@@ -13,7 +13,6 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
-use tokio::sync::Mutex;
 
 pub const TOKEN_HEADER: &str = "cf-access-jwt-assertion";
 const REFETCH_EVERY: Duration = Duration::from_secs(60);
@@ -30,6 +29,10 @@ pub fn access_config(team: Option<String>, aud: Option<String>) -> Result<Option
     let team = team.filter(|s| !s.is_empty());
     let aud = aud.filter(|s| !s.is_empty());
     match (team, aud) {
+        // The keys that decide who gets in must not be fetched over a connection anyone can alter
+        (Some(team), _) if !team.starts_with("https://") => {
+            bail!("access_team (or KIDTIME_ACCESS_TEAM) must start with https://, but is {team:?}")
+        }
         (Some(team), Some(aud)) => Ok(Some(AccessConfig {
             team: team.trim_end_matches('/').to_string(),
             aud,
@@ -41,7 +44,8 @@ pub fn access_config(team: Option<String>, aud: Option<String>) -> Result<Option
     }
 }
 
-/// Allows a key refetch at most once a minute, so tokens with made-up key ids can't cause a fetch each.
+/// Allows a key fetch at most once a minute, so neither tokens with made-up key ids nor requests
+/// arriving while the provider is unreachable can cause a fetch each.
 #[derive(Default)]
 struct RefetchGate {
     last: Option<Instant>,
@@ -61,15 +65,19 @@ impl RefetchGate {
 }
 
 struct Keys {
-    set: Option<JwkSet>,
+    set: Option<Arc<JwkSet>>,
     gate: RefetchGate,
 }
 
 pub struct Auth {
     config: AccessConfig,
+    /// Only ever locked briefly, never across a fetch.
     keys: Mutex<Keys>,
     /// None in tests: the keys given up front are all there is.
     client: Option<reqwest::Client>,
+    /// How many fetches were started, so tests can tell the gate held one back.
+    #[cfg(test)]
+    fetches: std::sync::atomic::AtomicUsize,
 }
 
 #[derive(serde::Deserialize)]
@@ -85,6 +93,7 @@ impl Auth {
     pub fn new(config: AccessConfig) -> Self {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
+            .https_only(true)
             .build()
             .expect("HTTP client");
         Self {
@@ -94,6 +103,23 @@ impl Auth {
                 gate: RefetchGate::default(),
             }),
             client: Some(client),
+            #[cfg(test)]
+            fetches: Default::default(),
+        }
+    }
+
+    /// No keys and no way to fetch any.
+    #[cfg(test)]
+    pub fn without_keys(config: AccessConfig) -> Self {
+        Self {
+            config,
+            keys: Mutex::new(Keys {
+                set: None,
+                gate: RefetchGate::default(),
+            }),
+            client: None,
+            #[cfg(test)]
+            fetches: Default::default(),
         }
     }
 
@@ -102,35 +128,55 @@ impl Auth {
         Self {
             config,
             keys: Mutex::new(Keys {
-                set: Some(keys),
+                set: Some(Arc::new(keys)),
                 gate: RefetchGate::default(),
             }),
             client: None,
+            #[cfg(test)]
+            fetches: Default::default(),
+        }
+    }
+
+    /// Fetches the keys once at start-up, so the first request doesn't have to. If this fails the
+    /// server still starts, and answers 503 until a later fetch works.
+    pub async fn warm(&self) {
+        match self.fetch_if_allowed().await {
+            Some(keys) => tracing::info!("login check is on: loaded {} keys", keys.keys.len()),
+            None => tracing::error!(
+                "login keys could not be loaded: requests get 503 until they can be"
+            ),
         }
     }
 
     pub async fn check(&self, token: Option<&str>) -> Result<(), StatusCode> {
         let token = token.ok_or(StatusCode::UNAUTHORIZED)?;
-        let mut keys = self.keys.lock().await;
-        if keys.set.is_none() {
-            keys.set = Some(self.fetch().await.ok_or(StatusCode::SERVICE_UNAVAILABLE)?);
-        }
-        match self.verify(token, keys.set.as_ref().expect("keys were just loaded")) {
-            Ok(()) => Ok(()),
-            Err(Rejected::Invalid) => Err(StatusCode::UNAUTHORIZED),
-            Err(Rejected::UnknownKey) => {
+        let cached = self.keys.lock().unwrap().set.clone();
+        // What to answer if fresh keys can't be had. Every path below ends in a verified token or
+        // an error: there is no way through without keys.
+        let otherwise = match &cached {
+            // Without keys nobody can be told apart
+            None => StatusCode::SERVICE_UNAVAILABLE,
+            Some(keys) => match self.verify(token, keys) {
+                Ok(()) => return Ok(()),
+                Err(Rejected::Invalid) => return Err(StatusCode::UNAUTHORIZED),
                 // The provider rotates its keys; try once with fresh ones
-                if !keys.gate.allow(Instant::now()) {
-                    return Err(StatusCode::UNAUTHORIZED);
-                }
-                let Some(fresh) = self.fetch().await else {
-                    return Err(StatusCode::UNAUTHORIZED);
-                };
-                keys.set = Some(fresh);
-                self.verify(token, keys.set.as_ref().expect("keys were just loaded"))
-                    .map_err(|_| StatusCode::UNAUTHORIZED)
-            }
+                Err(Rejected::UnknownKey) => StatusCode::UNAUTHORIZED,
+            },
+        };
+        let fresh = self.fetch_if_allowed().await.ok_or(otherwise)?;
+        self.verify(token, &fresh)
+            .map_err(|_| StatusCode::UNAUTHORIZED)
+    }
+
+    /// Fetches and stores the keys, unless a fetch was already started within the last minute.
+    /// The lock is taken to ask the gate and again to store, and is free during the fetch itself.
+    async fn fetch_if_allowed(&self) -> Option<Arc<JwkSet>> {
+        if !self.keys.lock().unwrap().gate.allow(Instant::now()) {
+            return None;
         }
+        let fresh = Arc::new(self.fetch().await?);
+        self.keys.lock().unwrap().set = Some(fresh.clone());
+        Some(fresh)
     }
 
     fn verify(&self, token: &str, keys: &JwkSet) -> Result<(), Rejected> {
@@ -149,6 +195,9 @@ impl Auth {
     }
 
     async fn fetch(&self) -> Option<JwkSet> {
+        #[cfg(test)]
+        self.fetches
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let client = self.client.as_ref()?;
         let url = format!("{}/cdn-cgi/access/certs", self.config.team);
         let result = async {
@@ -298,6 +347,96 @@ mod tests {
             auth().check(Some(&format!("{header}.{payload}."))).await,
             Err(StatusCode::UNAUTHORIZED)
         );
+    }
+
+    #[tokio::test]
+    async fn a_token_without_issuer_or_audience_is_unauthorized() {
+        let a = auth();
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some("key-1".into());
+        let exp = chrono::Utc::now().timestamp() + 600;
+        let sign =
+            |claims: serde_json::Value| jsonwebtoken::encode(&header, &claims, &key().0).unwrap();
+        // The same claims with nothing left out do pass, so the rejections below are about the gap
+        assert_eq!(
+            a.check(Some(&sign(
+                json!({ "iss": TEAM, "aud": [AUD], "exp": exp })
+            )))
+            .await,
+            Ok(())
+        );
+        assert_eq!(
+            a.check(Some(&sign(json!({ "aud": [AUD], "exp": exp }))))
+                .await,
+            Err(StatusCode::UNAUTHORIZED),
+            "no issuer"
+        );
+        assert_eq!(
+            a.check(Some(&sign(json!({ "iss": TEAM, "exp": exp }))))
+                .await,
+            Err(StatusCode::UNAUTHORIZED),
+            "no audience"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_keys_a_token_gets_503_and_no_token_gets_401() {
+        let a = Auth::without_keys(AccessConfig {
+            team: TEAM.into(),
+            aud: AUD.into(),
+        });
+        let good = token("key-1", TEAM, AUD, 600);
+        assert_eq!(a.check(None).await, Err(StatusCode::UNAUTHORIZED));
+        // The first attempt may fetch (and fails: there is no client); the second is inside the
+        // gate's minute and must answer without trying
+        assert_eq!(
+            a.check(Some(&good)).await,
+            Err(StatusCode::SERVICE_UNAVAILABLE)
+        );
+        assert_eq!(
+            a.check(Some(&good)).await,
+            Err(StatusCode::SERVICE_UNAVAILABLE)
+        );
+        assert_eq!(a.check(None).await, Err(StatusCode::UNAUTHORIZED));
+        assert_eq!(a.fetches.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_start_up_fetch_holds_back_the_next_one() {
+        let a = Auth::without_keys(AccessConfig {
+            team: TEAM.into(),
+            aud: AUD.into(),
+        });
+        a.warm().await;
+        assert_eq!(
+            a.check(Some(&token("key-1", TEAM, AUD, 600))).await,
+            Err(StatusCode::SERVICE_UNAVAILABLE)
+        );
+        assert_eq!(a.fetches.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn unknown_key_ids_cause_at_most_one_refetch() {
+        let a = auth();
+        for _ in 0..3 {
+            assert_eq!(
+                a.check(Some(&token("key-9", TEAM, AUD, 600))).await,
+                Err(StatusCode::UNAUTHORIZED)
+            );
+        }
+        assert_eq!(a.fetches.load(std::sync::atomic::Ordering::Relaxed), 1);
+        // Tokens signed with a known key still pass, and need no fetch
+        assert_eq!(a.check(Some(&token("key-1", TEAM, AUD, 600))).await, Ok(()));
+        assert_eq!(a.fetches.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn the_team_url_must_be_https() {
+        let error = access_config(Some("http://team.example.com".into()), Some(AUD.into()))
+            .err()
+            .expect("http must be refused");
+        assert!(error.to_string().contains("access_team"), "{error}");
+        assert!(error.to_string().contains("https://"), "{error}");
     }
 
     #[test]

@@ -11,7 +11,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use chrono::{Datelike, Days, Local, NaiveDate, NaiveDateTime, TimeZone};
-use protocol::{Report, UserState};
+use protocol::{App, Report, Sample, UserSample, UserState};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
@@ -48,13 +48,61 @@ pub struct Event {
     pub id: i64,
     pub user: String,
     pub at: i64,
-    /// "locked", "closed" or "allowed".
+    /// "locked", "closed" or "allowed". Rows of kind "state" are never returned.
     pub kind: String,
     pub detail: String,
 }
 
 const KEEP_SECS: i64 = 30 * 86400;
 const ALLOWED_KEY: &str = "allowed|";
+/// Kind of an event row that only remembers the latest decision, for later comparisons. Not shown.
+const STATE_KIND: &str = "state";
+
+/// Longest account name, host name, app id or app name that is stored, in characters.
+const MAX_NAME_CHARS: usize = 200;
+/// Most apps recorded for one user in one sample.
+const MAX_APPS_PER_USER: usize = 50;
+
+fn clip(text: &str) -> String {
+    text.chars().take(MAX_NAME_CHARS).collect()
+}
+
+/// A copy of the report with what agents send cut down to what is worth storing: long names are
+/// clipped, apps without an id are dropped, and each user keeps only their first apps.
+fn sanitised(report: &Report) -> Report {
+    Report {
+        host: clip(&report.host),
+        agent_id: report.agent_id.clone(),
+        interval_secs: report.interval_secs,
+        samples: report
+            .samples
+            .iter()
+            .map(|sample| Sample {
+                seq: sample.seq,
+                at: sample.at,
+                elapsed_secs: sample.elapsed_secs,
+                users: sample
+                    .users
+                    .iter()
+                    .map(|user| UserSample {
+                        user: clip(&user.user),
+                        state: user.state,
+                        apps: user
+                            .apps
+                            .iter()
+                            .filter(|app| !app.id.is_empty())
+                            .take(MAX_APPS_PER_USER)
+                            .map(|app| App {
+                                id: clip(&app.id),
+                                name: clip(&app.name),
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+            })
+            .collect(),
+    }
+}
 
 fn decision_key(decision: &Decision) -> String {
     let computer = match &decision.computer {
@@ -198,8 +246,11 @@ impl Db {
         Ok(Self { conn })
     }
 
-    /// Adds the report's usage, skipping samples already recorded.
-    pub fn record(&mut self, report: &Report) -> Result<()> {
+    /// Adds the report's usage, skipping samples already recorded. Returns the report as it was
+    /// recorded: names clipped and surplus apps dropped.
+    pub fn record(&mut self, report: &Report) -> Result<Report> {
+        // Everything below uses only this copy, so every table sees the same values
+        let report = sanitised(report);
         let tx = self.conn.transaction()?;
         let last_seq: u64 = tx
             .query_row(
@@ -302,7 +353,7 @@ impl Db {
             params![report.host, report.agent_id, max_seq as i64],
         )?;
         tx.commit()?;
-        Ok(())
+        Ok(report)
     }
 
     /// Users with any usage since `since`.
@@ -613,7 +664,9 @@ impl Db {
         Ok(rules::decide(&rule, &spans, &used, now))
     }
 
-    /// Adds an event if the decision differs from the account's last logged one.
+    /// Remembers the decision if it differs from the account's last one. Returns whether that added
+    /// an event to show: a new lock, a newly used-up category, or everything allowed again. Other
+    /// changes are stored as rows that `events` leaves out.
     pub fn log_decision(&mut self, user: &str, at: i64, decision: &Decision) -> Result<bool> {
         let key = decision_key(decision);
         let last: String = self
@@ -655,26 +708,31 @@ impl Db {
                 .filter(|c| c.used_up && !before.contains(&c.category.to_string().as_str()))
                 .map(|c| name_of(c.category))
                 .collect();
-            if newly.is_empty() {
+            if !newly.is_empty() {
+                ("closed", newly.join(", "))
+            } else if key == ALLOWED_KEY {
                 ("allowed", String::new())
             } else {
-                ("closed", newly.join(", "))
+                // Something eased but not everything, e.g. the lock ended with games still used
+                // up. "Allowed again" would be wrong, so only the new key is kept.
+                (STATE_KIND, String::new())
             }
         };
         self.conn.execute(
             "INSERT INTO event (user, at, key, kind, detail) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![user, at, key, kind, detail],
         )?;
-        Ok(true)
+        Ok(kind != STATE_KIND)
     }
 
     /// Newest first.
     pub fn events(&self, user: Option<&str>, limit: u32) -> Result<Vec<Event>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, user, at, kind, detail FROM event WHERE ?1 IS NULL OR user = ?1 ORDER BY id DESC LIMIT ?2",
+            "SELECT id, user, at, kind, detail FROM event
+             WHERE (?1 IS NULL OR user = ?1) AND kind != ?3 ORDER BY id DESC LIMIT ?2",
         )?;
         let rows = stmt
-            .query_map(params![user, limit], |r| {
+            .query_map(params![user, limit, STATE_KIND], |r| {
                 Ok(Event {
                     id: r.get(0)?,
                     user: r.get(1)?,
@@ -727,7 +785,6 @@ fn merge(intervals: Vec<(i64, i64)>) -> Vec<(i64, i64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use protocol::{App, Sample, UserSample, UserState};
 
     fn report(agent_id: &str, seqs: &[u64], state: UserState) -> Report {
         report_from("pc", agent_id, seqs, state, start_of_test())
@@ -1288,6 +1345,213 @@ mod tests {
             ]
         );
         assert_eq!(db.events(Some("kid1"), 2).unwrap().len(), 2);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    fn kinds(db: &Db) -> Vec<(String, String)> {
+        db.events(Some("kid1"), 50)
+            .unwrap()
+            .into_iter()
+            .rev()
+            .map(|e| (e.kind, e.detail))
+            .collect()
+    }
+
+    fn pair(kind: &str, detail: &str) -> (String, String) {
+        (kind.to_string(), detail.to_string())
+    }
+
+    #[test]
+    fn a_budget_reset_while_locked_is_not_logged_as_allowed() {
+        let (mut db, path) = temp_db("events-reset");
+        db.log_decision(
+            "kid1",
+            100,
+            &decision_of(Computer::OutsideSchedule, &[GAMES]),
+        )
+        .unwrap();
+        // Midnight: the budget is fresh, but the computer is still outside its hours
+        assert!(
+            !db.log_decision("kid1", 110, &decision_of(Computer::OutsideSchedule, &[]))
+                .unwrap()
+        );
+        assert_eq!(kinds(&db), [pair("locked", "outside schedule")]);
+        // The change was still remembered: the same decision again adds no row
+        let rows = |db: &Db| -> i64 {
+            db.conn
+                .query_row("SELECT COUNT(*) FROM event", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(rows(&db), 2);
+        db.log_decision("kid1", 120, &decision_of(Computer::OutsideSchedule, &[]))
+            .unwrap();
+        assert_eq!(rows(&db), 2);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn unlocking_with_games_still_used_up_is_not_logged_as_allowed() {
+        let (mut db, path) = temp_db("events-unlock");
+        db.log_decision(
+            "kid1",
+            100,
+            &decision_of(Computer::OutsideSchedule, &[GAMES]),
+        )
+        .unwrap();
+        assert!(
+            !db.log_decision("kid1", 110, &decision_of(Computer::Allowed, &[GAMES]))
+                .unwrap()
+        );
+        // Games were already used up before, so there is nothing new to close either
+        assert_eq!(kinds(&db), [pair("locked", "outside schedule")]);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn unlocking_with_nothing_used_up_is_logged_as_allowed() {
+        let (mut db, path) = temp_db("events-allowed");
+        db.log_decision(
+            "kid1",
+            100,
+            &decision_of(Computer::OutsideSchedule, &[GAMES]),
+        )
+        .unwrap();
+        assert!(
+            db.log_decision("kid1", 110, &decision_of(Computer::Allowed, &[]))
+                .unwrap()
+        );
+        assert_eq!(
+            kinds(&db),
+            [pair("locked", "outside schedule"), pair("allowed", "")]
+        );
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn unlocking_into_a_newly_used_up_category_is_logged_as_closed() {
+        let (mut db, path) = temp_db("events-unlock-closed");
+        db.log_decision("kid1", 100, &decision_of(Computer::OutsideSchedule, &[]))
+            .unwrap();
+        assert!(
+            db.log_decision("kid1", 110, &decision_of(Computer::Allowed, &[GAMES]))
+                .unwrap()
+        );
+        assert_eq!(
+            kinds(&db),
+            [pair("locked", "outside schedule"), pair("closed", "Games")]
+        );
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn categories_used_up_one_after_the_other_each_log_closed() {
+        let (mut db, path) = temp_db("events-two");
+        db.conn
+            .execute("INSERT INTO category (id, name) VALUES (2, 'Videos')", [])
+            .unwrap();
+        db.log_decision("kid1", 100, &decision_of(Computer::Allowed, &[GAMES]))
+            .unwrap();
+        db.log_decision("kid1", 110, &decision_of(Computer::Allowed, &[GAMES, 2]))
+            .unwrap();
+        assert_eq!(
+            kinds(&db),
+            [pair("closed", "Games"), pair("closed", "Videos")]
+        );
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn a_used_up_category_cleared_is_logged_as_allowed() {
+        let (mut db, path) = temp_db("events-cleared");
+        db.log_decision("kid1", 100, &decision_of(Computer::Allowed, &[GAMES]))
+            .unwrap();
+        assert!(
+            db.log_decision("kid1", 110, &decision_of(Computer::Allowed, &[]))
+                .unwrap()
+        );
+        assert_eq!(kinds(&db), [pair("closed", "Games"), pair("allowed", "")]);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    fn count(db: &Db, sql: &str) -> i64 {
+        db.conn.query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn long_reported_strings_are_cut_to_the_limit() {
+        let (mut db, path) = temp_db("long");
+        // Multi-byte characters, so a byte-index cut would land inside one
+        let long = "é".repeat(1000);
+        let mut report = sample_report(
+            &long,
+            1,
+            start_of_test() + 15,
+            UserState::Active,
+            &[(&long, &long)],
+        );
+        report.samples[0].users[0].user = long.clone();
+        db.record(&report).unwrap();
+
+        let app = db.apps().unwrap().remove(0);
+        assert_eq!(app.app_id.chars().count(), 200);
+        assert_eq!(app.name.chars().count(), 200);
+        let cut: String = long.chars().take(200).collect();
+        assert!(db.is_account(&cut).unwrap());
+        let today = Local::now().date_naive();
+        // Every table saw the same cut values
+        assert_eq!(db.daily_totals(&cut, today, today).unwrap()[0].1, 15);
+        assert_eq!(db.host_totals(&cut, today).unwrap()[0].0, cut);
+        assert_eq!(db.app_totals(&cut, today).unwrap()[0].name, cut);
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM app_activity WHERE LENGTH(user) = 200 AND LENGTH(host) = 200 AND LENGTH(app_id) = 200"
+            ),
+            1
+        );
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn an_app_with_an_empty_id_is_skipped() {
+        let (mut db, path) = temp_db("empty-id");
+        db.record(&sample_report(
+            "host-a",
+            1,
+            start_of_test() + 15,
+            UserState::Active,
+            &[("", "Nameless")],
+        ))
+        .unwrap();
+        assert!(db.apps().unwrap().is_empty());
+        // The only row with an empty app id is the host total, counted once
+        assert_eq!(count(&db, "SELECT COUNT(*) FROM usage"), 1);
+        assert_eq!(
+            count(&db, "SELECT secs FROM usage WHERE app_id = ''"),
+            15,
+            "the host total must not be doubled by the nameless app"
+        );
+        assert_eq!(count(&db, "SELECT COUNT(*) FROM app_activity"), 0);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn only_the_first_fifty_apps_of_a_sample_are_recorded() {
+        let (mut db, path) = temp_db("many-apps");
+        let ids: Vec<String> = (0..60).map(|i| format!("app-{i:02}")).collect();
+        let apps: Vec<(&str, &str)> = ids.iter().map(|id| (id.as_str(), "App")).collect();
+        db.record(&sample_report(
+            "host-a",
+            1,
+            start_of_test() + 15,
+            UserState::Active,
+            &apps,
+        ))
+        .unwrap();
+        let catalogue = db.apps().unwrap();
+        assert_eq!(catalogue.len(), 50);
+        assert!(catalogue.iter().any(|a| a.app_id == "app-49"));
+        assert!(catalogue.iter().all(|a| a.app_id != "app-50"));
         std::fs::remove_file(&path).unwrap();
     }
 

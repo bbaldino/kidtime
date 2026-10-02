@@ -159,6 +159,10 @@ pub async fn post_blackout(
     let start = parse_local("start", &new.start)?;
     let end = parse_local("end", &new.end)?;
     rules::validate_blackout(start, end)?;
+    // One that has already ended would never be listed, so it could never be deleted either
+    if end <= Local::now().naive_local() {
+        return Err(invalid("end", "a blackout must end in the future"));
+    }
     let mut db = state.db.lock().unwrap();
     if let Some(user) = &new.user
         && !db.is_account(user)?
@@ -296,10 +300,14 @@ mod tests {
 
     /// Makes `kid1` a known account with one app in the catalogue.
     async fn report(app: &TestApp, app_id: &str) {
+        report_as(app, app_id, "active").await;
+    }
+
+    async fn report_as(app: &TestApp, app_id: &str, state: &str) {
         let at = chrono::Local::now().timestamp();
         let body = json!({ "host": "host-a", "agent_id": "a", "interval_secs": 15, "samples": [{
             "seq": 1, "at": at, "elapsed_secs": 15,
-            "users": [{ "user": "kid1", "state": "active", "apps": [{ "id": app_id, "name": "Some App" }] }],
+            "users": [{ "user": "kid1", "state": state, "apps": [{ "id": app_id, "name": "Some App" }] }],
         }]});
         let request = Request::builder()
             .method("POST")
@@ -510,6 +518,44 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn events_are_logged_only_for_accounts_in_use() {
+        let app = app("in-use");
+        // The first report makes the account known, so rules can be set for it
+        report_as(&app, "steam:1", "offline").await;
+        for weekday in 0..7 {
+            let rule = json!({ "restricted": true, "stretches": [] });
+            let uri = format!("/api/rules/kid1/{weekday}");
+            assert_eq!(
+                call(&app, "PUT", &uri, Some(rule)).await.0,
+                StatusCode::NO_CONTENT
+            );
+        }
+
+        // Nobody is at the computer: there is nothing to lock
+        report_as(&app, "steam:1", "offline").await;
+        report_as(&app, "steam:1", "background").await;
+        let (_, events) = call(&app, "GET", "/api/events", None).await;
+        assert_eq!(events, json!([]));
+
+        report_as(&app, "steam:1", "active").await;
+        let (_, events) = call(&app, "GET", "/api/events", None).await;
+        assert_eq!(events.as_array().unwrap().len(), 1);
+        assert_eq!(events[0]["kind"], "locked");
+        assert_eq!(events[0]["user"], "kid1");
+    }
+
+    #[tokio::test]
+    async fn a_blackout_that_has_already_ended_is_rejected() {
+        let app = app("blackout-past");
+        report(&app, "steam:1").await;
+        let past = json!({ "user": "kid1", "start": "2001-01-01T17:00", "end": "2001-01-01T19:00", "note": "" });
+        let (status, body) = call(&app, "POST", "/api/blackouts", Some(past)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["field"], "end");
+        assert_eq!(body["error"], "a blackout must end in the future");
     }
 
     #[tokio::test]

@@ -85,6 +85,10 @@ async fn main() -> Result<()> {
         );
     }
     let auth = access.map(|c| Arc::new(auth::Auth::new(c)));
+    if let Some(auth) = &auth {
+        // Start-up continues either way: without keys the login check answers 503, never lets anyone in
+        auth.warm().await;
+    }
 
     let state = Arc::new(AppState {
         db: Mutex::new(
@@ -212,7 +216,7 @@ fn now() -> i64 {
 async fn report(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(report): Json<Report>,
+    Json(mut report): Json<Report>,
 ) -> Response {
     let authorized = headers
         .get(header::AUTHORIZATION)
@@ -225,15 +229,23 @@ async fn report(
 
     {
         let mut db = state.db.lock().unwrap();
-        if let Err(e) = db.record(&report) {
-            tracing::error!("recording report from {}: {e:#}", report.host);
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
+        // From here on only the report as recorded is used, with its names clipped
+        report = match db.record(&report) {
+            Ok(recorded) => recorded,
+            Err(e) => {
+                tracing::error!("recording report from {}: {e:#}", report.host);
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        };
         let now_local = Local::now().naive_local();
+        // Agents report every tracked account in every sample. Only the ones at a computer right
+        // now have anything to lock or close.
         let mut users: Vec<&str> = report
             .samples
-            .iter()
-            .flat_map(|s| s.users.iter().map(|u| u.user.as_str()))
+            .last()
+            .into_iter()
+            .flat_map(|s| s.users.iter().filter(|u| u.state.counts()))
+            .map(|u| u.user.as_str())
             .collect();
         users.sort_unstable();
         users.dedup();
