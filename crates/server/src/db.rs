@@ -10,12 +10,12 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use chrono::{Days, Local, NaiveDate, TimeZone};
+use chrono::{Datelike, Days, Local, NaiveDate, NaiveDateTime, TimeZone};
 use protocol::{Report, UserState};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-use crate::rules::CategoryId;
+use crate::rules::{self, BlackoutSpan, CategoryId, DayRule, Decision, Stretch};
 
 /// The one category created at first start.
 pub const GAMES: CategoryId = 1;
@@ -30,6 +30,30 @@ pub struct AppEntry {
     pub category_id: Option<CategoryId>,
     pub set_by_person: bool,
     pub reviewed: bool,
+}
+
+/// A one-off blackout. `user: None` applies to every restricted account.
+#[allow(dead_code)]
+#[derive(Debug, Serialize)]
+pub struct Blackout {
+    pub id: i64,
+    pub user: Option<String>,
+    pub start: NaiveDateTime,
+    pub end: NaiveDateTime,
+    pub note: String,
+}
+
+/// How local date-times are stored; this form sorts correctly as text.
+const LOCAL_TIME: &str = "%Y-%m-%dT%H:%M:%S";
+
+fn local_text(t: NaiveDateTime) -> String {
+    t.format(LOCAL_TIME).to_string()
+}
+
+fn parse_local(text: String) -> rusqlite::Result<NaiveDateTime> {
+    NaiveDateTime::parse_from_str(&text, LOCAL_TIME).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })
 }
 
 /// `app_id` used for a user's overall total, as opposed to a single app.
@@ -105,7 +129,34 @@ impl Db {
                  start  INTEGER NOT NULL,
                  end    INTEGER NOT NULL
              );
-             CREATE INDEX IF NOT EXISTS app_activity_user_end ON app_activity (user, end);",
+             CREATE INDEX IF NOT EXISTS app_activity_user_end ON app_activity (user, end);
+             CREATE TABLE IF NOT EXISTS day_rule (
+                 user       TEXT NOT NULL,
+                 weekday    INTEGER NOT NULL,
+                 restricted INTEGER NOT NULL,
+                 PRIMARY KEY (user, weekday)
+             );
+             CREATE TABLE IF NOT EXISTS stretch (
+                 user      TEXT NOT NULL,
+                 weekday   INTEGER NOT NULL,
+                 start_min INTEGER NOT NULL,
+                 end_min   INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS stretch_user_weekday ON stretch (user, weekday);
+             CREATE TABLE IF NOT EXISTS budget (
+                 user        TEXT NOT NULL,
+                 weekday     INTEGER NOT NULL,
+                 category_id INTEGER NOT NULL REFERENCES category (id),
+                 minutes     INTEGER NOT NULL,
+                 PRIMARY KEY (user, weekday, category_id)
+             );
+             CREATE TABLE IF NOT EXISTS blackout (
+                 id    INTEGER PRIMARY KEY,
+                 user  TEXT,
+                 start TEXT NOT NULL,
+                 end   TEXT NOT NULL,
+                 note  TEXT NOT NULL
+             );",
         )?;
         Ok(Self { conn })
     }
@@ -380,6 +431,162 @@ impl Db {
                 (category, secs)
             })
             .collect())
+    }
+
+    #[allow(dead_code)]
+    pub fn day_rule(&self, user: &str, weekday: u8) -> Result<DayRule> {
+        let restricted = self
+            .conn
+            .query_row(
+                "SELECT restricted FROM day_rule WHERE user = ?1 AND weekday = ?2",
+                params![user, weekday],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(false);
+        let mut stmt = self.conn.prepare(
+            "SELECT start_min, end_min FROM stretch WHERE user = ?1 AND weekday = ?2 ORDER BY start_min",
+        )?;
+        let stretches = stmt
+            .query_map(params![user, weekday], |r| {
+                Ok(Stretch {
+                    start_min: r.get(0)?,
+                    end_min: r.get(1)?,
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT category_id, minutes FROM budget WHERE user = ?1 AND weekday = ?2")?;
+        let budgets = stmt
+            .query_map(params![user, weekday], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<_, _>>()?;
+        Ok(DayRule {
+            restricted,
+            stretches,
+            budgets,
+        })
+    }
+
+    /// Monday first.
+    #[allow(dead_code)]
+    pub fn week_rules(&self, user: &str) -> Result<Vec<DayRule>> {
+        (0..7).map(|weekday| self.day_rule(user, weekday)).collect()
+    }
+
+    /// Replaces the weekday's rule. The caller validates it first.
+    #[allow(dead_code)]
+    pub fn set_day_rule(&mut self, user: &str, weekday: u8, rule: &DayRule) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "DELETE FROM day_rule WHERE user = ?1 AND weekday = ?2",
+            params![user, weekday],
+        )?;
+        tx.execute(
+            "DELETE FROM stretch WHERE user = ?1 AND weekday = ?2",
+            params![user, weekday],
+        )?;
+        tx.execute(
+            "DELETE FROM budget WHERE user = ?1 AND weekday = ?2",
+            params![user, weekday],
+        )?;
+        if rule.restricted {
+            tx.execute(
+                "INSERT INTO day_rule (user, weekday, restricted) VALUES (?1, ?2, 1)",
+                params![user, weekday],
+            )?;
+            for s in &rule.stretches {
+                tx.execute(
+                    "INSERT INTO stretch (user, weekday, start_min, end_min) VALUES (?1, ?2, ?3, ?4)",
+                    params![user, weekday, s.start_min, s.end_min],
+                )?;
+            }
+        }
+        for (category, minutes) in &rule.budgets {
+            tx.execute(
+                "INSERT INTO budget (user, weekday, category_id, minutes) VALUES (?1, ?2, ?3, ?4)",
+                params![user, weekday, category, minutes],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Whether the account has any rule: a restricted day or a budget.
+    #[allow(dead_code)]
+    pub fn is_restricted(&self, user: &str) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM day_rule WHERE user = ?1 AND restricted = 1)
+                 OR EXISTS (SELECT 1 FROM budget WHERE user = ?1)",
+            [user],
+            |r| r.get(0),
+        )?)
+    }
+
+    #[allow(dead_code)]
+    pub fn add_blackout(
+        &mut self,
+        user: Option<&str>,
+        start: NaiveDateTime,
+        end: NaiveDateTime,
+        note: &str,
+    ) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO blackout (user, start, end, note) VALUES (?1, ?2, ?3, ?4)",
+            params![user, local_text(start), local_text(end), note],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    #[allow(dead_code)]
+    pub fn delete_blackout(&mut self, id: i64) -> Result<bool> {
+        Ok(self
+            .conn
+            .execute("DELETE FROM blackout WHERE id = ?1", [id])?
+            > 0)
+    }
+
+    /// Blackouts that haven't ended at `now`, earliest start first.
+    #[allow(dead_code)]
+    pub fn blackouts(&self, now: NaiveDateTime) -> Result<Vec<Blackout>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, user, start, end, note FROM blackout WHERE end > ?1 ORDER BY start, id",
+        )?;
+        let rows = stmt
+            .query_map([local_text(now)], |r| {
+                Ok(Blackout {
+                    id: r.get(0)?,
+                    user: r.get(1)?,
+                    start: parse_local(r.get(2)?)?,
+                    end: parse_local(r.get(3)?)?,
+                    note: r.get(4)?,
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    /// What the rules say for the account at `now`.
+    #[allow(dead_code)]
+    pub fn decision(&self, user: &str, now: NaiveDateTime) -> Result<Decision> {
+        let weekday = now.date().weekday().num_days_from_monday() as u8;
+        let rule = self.day_rule(user, weekday)?;
+        let restricted = self.is_restricted(user)?;
+        let spans: Vec<BlackoutSpan> = self
+            .blackouts(now)?
+            .into_iter()
+            .filter(|b| match &b.user {
+                Some(name) => name == user,
+                None => restricted,
+            })
+            .map(|b| BlackoutSpan {
+                start: b.start,
+                end: b.end,
+                note: b.note,
+            })
+            .collect();
+        let used = self.category_secs(user, now.date())?;
+        Ok(rules::decide(&rule, &spans, &used, now))
     }
 }
 
@@ -761,6 +968,158 @@ mod tests {
         assert!(db.apps().unwrap().is_empty());
         // The account is still known: it reported
         assert!(db.is_account("kid1").unwrap());
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    use crate::rules::{Computer, DayRule, Stretch};
+
+    fn noon_today() -> chrono::NaiveDateTime {
+        Local::now().date_naive().and_hms_opt(12, 0, 0).unwrap()
+    }
+
+    fn weekday_today() -> u8 {
+        Local::now().date_naive().weekday().num_days_from_monday() as u8
+    }
+
+    #[test]
+    fn day_rules_round_trip_and_replace() {
+        let (mut db, path) = temp_db("rules");
+        assert_eq!(db.day_rule("kid1", 0).unwrap(), DayRule::default());
+        assert!(!db.is_restricted("kid1").unwrap());
+
+        let rule = DayRule {
+            restricted: true,
+            stretches: vec![
+                Stretch {
+                    start_min: 960,
+                    end_min: 1200,
+                },
+                Stretch {
+                    start_min: 375,
+                    end_min: 450,
+                },
+            ],
+            budgets: BTreeMap::from([(GAMES, 60)]),
+        };
+        db.set_day_rule("kid1", 0, &rule).unwrap();
+        let stored = db.day_rule("kid1", 0).unwrap();
+        // Stretches come back sorted by start
+        assert_eq!(stored.stretches[0].start_min, 375);
+        assert_eq!(stored.budgets, rule.budgets);
+        assert!(stored.restricted);
+        assert!(db.is_restricted("kid1").unwrap());
+        assert_eq!(db.week_rules("kid1").unwrap().len(), 7);
+        assert_eq!(db.week_rules("kid1").unwrap()[1], DayRule::default());
+
+        db.set_day_rule("kid1", 0, &DayRule::default()).unwrap();
+        assert_eq!(db.day_rule("kid1", 0).unwrap(), DayRule::default());
+        assert!(!db.is_restricted("kid1").unwrap());
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn a_budget_alone_makes_an_account_restricted() {
+        let (mut db, path) = temp_db("budget-only");
+        let rule = DayRule {
+            restricted: false,
+            stretches: vec![],
+            budgets: BTreeMap::from([(GAMES, 30)]),
+        };
+        db.set_day_rule("kid1", 3, &rule).unwrap();
+        assert!(db.is_restricted("kid1").unwrap());
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn blackouts_list_only_those_not_ended() {
+        let (mut db, path) = temp_db("blackouts");
+        let now = noon_today();
+        let hour = chrono::Duration::hours(1);
+        db.add_blackout(Some("kid1"), now - hour * 3, now - hour, "over")
+            .unwrap();
+        let current = db
+            .add_blackout(None, now - hour, now + hour, "now")
+            .unwrap();
+        db.add_blackout(Some("kid2"), now + hour * 5, now + hour * 6, "later")
+            .unwrap();
+        let listed = db.blackouts(now).unwrap();
+        assert_eq!(
+            listed.iter().map(|b| b.note.as_str()).collect::<Vec<_>>(),
+            ["now", "later"]
+        );
+        assert_eq!(listed[0].user, None);
+        assert!(db.delete_blackout(current).unwrap());
+        assert!(!db.delete_blackout(current).unwrap());
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn decision_applies_own_and_everyone_blackouts_only_to_restricted_accounts() {
+        let (mut db, path) = temp_db("decision");
+        let now = noon_today();
+        let hour = chrono::Duration::hours(1);
+        db.add_blackout(None, now - hour, now + hour, "everyone")
+            .unwrap();
+
+        // No rules: an "everyone" blackout doesn't touch this account
+        assert_eq!(
+            db.decision("parent", now).unwrap().computer,
+            Computer::Allowed
+        );
+
+        let rule = DayRule {
+            restricted: false,
+            stretches: vec![],
+            budgets: BTreeMap::from([(GAMES, 1)]),
+        };
+        db.set_day_rule("kid1", weekday_today(), &rule).unwrap();
+        let d = db.decision("kid1", now).unwrap();
+        assert_eq!(
+            d.computer,
+            Computer::Blackout {
+                until: now + hour,
+                note: "everyone".into()
+            }
+        );
+
+        // A blackout naming another account doesn't apply
+        db.set_day_rule("kid2", weekday_today(), &rule).unwrap();
+        db.add_blackout(Some("kid1"), now - hour, now + hour * 4, "kid1 only")
+            .unwrap();
+        let d = db.decision("kid2", now).unwrap();
+        assert_eq!(
+            d.computer,
+            Computer::Blackout {
+                until: now + hour,
+                note: "everyone".into()
+            }
+        );
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn decision_uses_todays_rule_and_todays_category_time() {
+        let (mut db, path) = temp_db("decision-budget");
+        let rule = DayRule {
+            restricted: false,
+            stretches: vec![],
+            budgets: BTreeMap::from([(GAMES, 1)]),
+        };
+        db.set_day_rule("kid1", weekday_today(), &rule).unwrap();
+        let t0 = start_of_test();
+        for seq in 1..=4 {
+            db.record(&sample_report(
+                "host-a",
+                seq,
+                t0 + 15 * seq as i64,
+                UserState::Active,
+                &[("steam:1", "Minecraft")],
+            ))
+            .unwrap();
+        }
+        let d = db.decision("kid1", noon_today()).unwrap();
+        assert_eq!(d.categories[0].used_secs, 60);
+        assert!(d.categories[0].used_up);
         std::fs::remove_file(&path).unwrap();
     }
 }
