@@ -51,7 +51,8 @@ async function api(path, { method = "GET", body } = {}) {
 let categories = [];
 const categoryName = (id) => categories.find((c) => c.id === id)?.name ?? "Uncategorised";
 
-function clock(text) {
+// With `withDate`, another day reads "Sat Oct 10, 5:00pm" rather than "Sat 5:00pm"
+function clock(text, withDate = false) {
   // "2026-10-05T20:00:00" is the server's local time; show it as written
   const [date, time] = text.split("T");
   const [h, m] = time.split(":").map(Number);
@@ -59,12 +60,15 @@ function clock(text) {
   const today = new Date();
   const todayText = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}-${String(today.getDate()).padStart(2, "0")}`;
   if (date === todayText) return label;
+  if (withDate) return `${parseDay(date).toLocaleDateString(undefined, { weekday: "short" })} ${parseDay(date).toLocaleDateString(undefined, { month: "short", day: "numeric" })}, ${label}`;
   return `${parseDay(date).toLocaleDateString(undefined, { weekday: "short" })} ${label}`;
 }
 
 function decisionHtml(u) {
-  if (!u.restricted || !u.decision) return "";
+  if (!u.decision) return "";
   const d = u.decision;
+  // An account with no rules of its own can still be named in a blackout
+  if (!u.restricted && d.computer.state === "allowed") return "";
   let line;
   if (d.computer.state === "allowed") {
     // next_change is not always the moment the state flips, so only name a time when it isn't just midnight
@@ -195,7 +199,8 @@ const updatedEl = document.getElementById("updated");
 async function refresh() {
   try {
     const [status, events] = await Promise.all([api("/api/status"), api("/api/events")]);
-    if (!categories.length) categories = await api("/api/categories");
+    // Without the names the cards still render; the next refresh asks again
+    if (!categories.length) categories = await api("/api/categories").catch(() => []);
     hideTip();
     usersEl.innerHTML = status.users.length
       ? status.users.map(cardHtml).join("")

@@ -47,7 +47,7 @@ function editorHtml(weekday) {
       <ul class="stretches" ${rule.restricted ? "" : "hidden"}>${rows}</ul>
       <button type="button" data-add ${rule.restricted ? "" : "hidden"}>Add allowed hours</button>
       <label class="switch"><input type="checkbox" name="limited" ${games === undefined ? "" : "checked"}> Limit games</label>
-      <label ${games === undefined ? "hidden" : ""}>Minutes of games <input type="number" name="minutes" min="0" max="1440" step="5" value="${games ?? 60}"></label>
+      <label ${games === undefined ? "hidden" : ""}>Minutes of games <input type="number" name="minutes" min="0" max="1440" step="5" value="${games ?? 60}" ${games === undefined ? "" : "required"}></label>
       <p class="form-error" role="alert" hidden></p>
       <div class="editor-actions">
         <button type="submit">Save</button>
@@ -75,7 +75,7 @@ function readEditor(form) {
 function blackoutsHtml(blackouts) {
   const rows = blackouts.map((b) => `
     <li>
-      <span>${esc(b.user ?? "All kids")}: ${esc(clock(b.start))} to ${esc(clock(b.end))}${b.note ? ` (${esc(b.note)})` : ""}</span>
+      <span>${esc(b.user ?? "All kids")}: ${esc(clock(b.start, true))} to ${esc(clock(b.end, true))}${b.note ? ` (${esc(b.note)})` : ""}</span>
       <button type="button" data-delete-blackout="${b.id}">Delete</button>
     </li>`).join("");
   const now = new Date(Date.now() - new Date().getTimezoneOffset() * 60000).toISOString().slice(0, 16);
@@ -83,8 +83,10 @@ function blackoutsHtml(blackouts) {
   return `
     <h2>Blackouts</h2>
     <ul class="blackouts">${rows || '<li class="empty-note">None.</li>'}</ul>
+    <p class="form-error" id="blackout-error" role="alert" hidden></p>
     <form class="editor" id="blackout-form">
       <label>Who <select name="user"><option value="">All kids</option>${who}</select></label>
+      <p class="footnote">"All kids" applies to kids that have a schedule or a budget.</p>
       <label>From <input type="datetime-local" name="start" value="${now}" required></label>
       <label>To <input type="datetime-local" name="end" required></label>
       <label>Note <input type="text" name="note" maxlength="80"></label>
@@ -98,11 +100,27 @@ function refocus(root, focusSel) {
   if (focusSel) root.querySelector(focusSel)?.focus();
 }
 
-async function renderRules(focusSel) {
-  const users = window.kidtimeUsers ?? [];
-  if (!users.length) { rulesEl.innerHTML = '<article class="card"><p class="empty-note">No accounts have reported yet.</p></article>'; return; }
-  rulesUser ??= users[0];
-  const [rules, blackouts] = await Promise.all([api(`/api/rules/${encodeURIComponent(rulesUser)}`), api("/api/blackouts")]);
+// What a tab shows when its data can't be fetched
+function loadFailed(root) {
+  root.innerHTML = `<article class="card"><p class="form-error" role="alert">Couldn't load. Try again.</p><div class="card-actions"><button type="button" data-retry>Retry</button></div></article>`;
+}
+
+// `message` is shown next to the blackout list, for a change that didn't go through
+async function renderRules(focusSel, message) {
+  let users, rules, blackouts;
+  try {
+    // The Today refresh normally supplies the accounts; this tab can be opened before it has finished
+    window.kidtimeUsers ??= (await api("/api/status")).users.map((u) => u.user);
+    users = window.kidtimeUsers;
+    if (!users.length) { rulesEl.innerHTML = '<article class="card"><p class="empty-note">No accounts have reported yet.</p></article>'; return; }
+    rulesUser ??= users[0];
+    [rules, blackouts] = await Promise.all([api(`/api/rules/${encodeURIComponent(rulesUser)}`), api("/api/blackouts")]);
+  } catch {
+    // After a failed change the page as it stands is still right: keep it, and say what went wrong
+    if (message && document.getElementById("blackout-error")) showBlackoutError(message);
+    else loadFailed(rulesEl);
+    return;
+  }
   week = rules.days;
   const picker = users.map((u) => `<button type="button" class="chip" data-user="${esc(u)}" ${u === rulesUser ? 'aria-pressed="true"' : 'aria-pressed="false"'}>${esc(u)}</button>`).join("");
   const days = week.map((rule, i) => editing === i ? `<li>${editorHtml(i)}</li>` : `
@@ -113,7 +131,14 @@ async function renderRules(focusSel) {
       <ul class="week-rules">${days}</ul>
     </article>
     <article class="card">${blackoutsHtml(blackouts)}</article>`;
+  if (message) showBlackoutError(message);
   refocus(rulesEl, focusSel);
+}
+
+function showBlackoutError(message) {
+  const el = document.getElementById("blackout-error");
+  el.textContent = message;
+  el.hidden = false;
 }
 
 function showError(form, error) {
@@ -126,6 +151,7 @@ rulesEl.addEventListener("click", async (e) => {
   const t = e.target.closest("button");
   if (!t) return;
   const form = t.closest("form");
+  if (t.dataset.retry !== undefined) return renderRules();
   if (t.dataset.user) { rulesUser = t.dataset.user; editing = null; return renderRules(`[data-user="${CSS.escape(t.dataset.user)}"]`); }
   if (t.dataset.edit !== undefined) { editing = Number(t.dataset.edit); return renderRules("form[data-weekday] [name=restricted]"); }
   if (t.dataset.cancel !== undefined) { const day = editing; editing = null; return renderRules(`[data-edit="${day}"]`); }
@@ -145,8 +171,14 @@ rulesEl.addEventListener("click", async (e) => {
     return saveDay(form, t.dataset.copy.split(",").map(Number));
   }
   if (t.dataset.deleteBlackout) {
-    await api(`/api/blackouts/${t.dataset.deleteBlackout}`, { method: "DELETE" });
-    return renderRules("#blackout-form [name=user]");
+    let message;
+    try {
+      await api(`/api/blackouts/${t.dataset.deleteBlackout}`, { method: "DELETE" });
+    } catch {
+      message = "Couldn't delete the blackout. Try again.";
+    }
+    // Either way the list is fetched again, so it shows what the server has
+    return renderRules("#blackout-form [name=user]", message);
   }
 });
 
@@ -195,23 +227,44 @@ rulesEl.addEventListener("submit", async (e) => {
   }
 });
 
-async function renderApps(focusApp) {
-  const apps = await api("/api/apps");
+let appList = []; // the catalogue as last fetched
+
+// `message` is shown in the card, for a change that didn't go through
+async function renderApps(focusApp, message) {
+  try {
+    // The Today refresh normally supplies the categories; this tab can be opened before it has finished
+    if (!categories.length) categories = await api("/api/categories");
+    appList = await api("/api/apps");
+  } catch {
+    // After a failed change, fall through and draw the last list fetched: it has the stored values
+    if (!message || !categories.length) { loadFailed(appsEl); return; }
+  }
   const options = (current) => [`<option value="" ${current === null ? "selected" : ""}>Uncategorised</option>`]
     .concat(categories.map((c) => `<option value="${c.id}" ${current === c.id ? "selected" : ""}>${esc(c.name)}</option>`)).join("");
-  const rows = apps.map((a) => `
+  const rows = appList.map((a) => `
     <li class="app-row">
       <span class="app-name">${a.reviewed ? "" : '<span class="badge">New</span> '}${esc(a.name)}</span>
       <span class="app-seen">last used ${esc(new Date(a.last_seen * 1000).toLocaleDateString(undefined, { month: "short", day: "numeric" }))}</span>
-      <select data-app="${esc(a.app_id)}" aria-label="Category for ${esc(a.name)}">${options(a.category_id)}</select>
+      <span class="app-controls">
+        <select data-app="${esc(a.app_id)}" aria-label="Category for ${esc(a.name)}">${options(a.category_id)}</select>
+        ${a.reviewed ? "" : `<button type="button" data-review="${esc(a.app_id)}" aria-label="${esc(a.name)} looks right">Looks right</button>`}
+      </span>
     </li>`).join("");
+  const anyNew = appList.some((a) => !a.reviewed);
   appsEl.innerHTML = `
     <article class="card">
       <p class="footnote">Only apps in a category with a budget use that budget. Steam games and anything played in a stream are set to Games automatically; change any of them here.</p>
       <p class="footnote">At the desktop an app counts while it is open and the kid is active, even in the background. Games launched outside Steam at the desktop may not be detected.</p>
+      ${anyNew ? '<div class="card-actions"><button type="button" data-review-all>Mark all as reviewed</button></div>' : ""}
+      <p class="form-error" id="apps-error" role="alert" hidden></p>
       <ul class="apps">${rows || '<li class="empty-note">No apps seen yet.</li>'}</ul>
     </article>`;
-  updateNewBadge(apps);
+  if (message) {
+    const el = document.getElementById("apps-error");
+    el.textContent = message;
+    el.hidden = false;
+  }
+  updateNewBadge(appList);
   if (focusApp) appsEl.querySelector(`select[data-app="${CSS.escape(focusApp)}"]`)?.focus();
 }
 
@@ -223,16 +276,46 @@ function updateNewBadge(apps) {
   badge.setAttribute("aria-label", `${count} new`);
 }
 
-appsEl.addEventListener("change", async (e) => {
+// Setting an app's category, even to the one it has, marks it reviewed
+const putApp = (appId, categoryId) => api(`/api/apps/${encodeURIComponent(appId)}`, { method: "PUT", body: { category_id: categoryId } });
+
+// Runs a change to the catalogue, then draws the list again from the server either way, so a select
+// never keeps showing a value that wasn't saved
+async function changeApps(change, focusApp) {
+  let message;
+  try {
+    await change();
+  } catch {
+    message = "Couldn't save. Try again.";
+  }
+  await renderApps(focusApp, message);
+}
+
+appsEl.addEventListener("change", (e) => {
   const select = e.target.closest("select[data-app]");
   if (!select) return;
-  await api(`/api/apps/${encodeURIComponent(select.dataset.app)}`, { method: "PUT", body: { category_id: select.value === "" ? null : Number(select.value) } });
-  await renderApps(select.dataset.app);
+  const appId = select.dataset.app;
+  return changeApps(() => putApp(appId, select.value === "" ? null : Number(select.value)), appId);
+});
+
+appsEl.addEventListener("click", (e) => {
+  const t = e.target.closest("button");
+  if (!t) return;
+  if (t.dataset.retry !== undefined) return renderApps();
+  if (t.dataset.review !== undefined) {
+    const app = appList.find((a) => a.app_id === t.dataset.review);
+    if (app) return changeApps(() => putApp(app.app_id, app.category_id), app.app_id);
+  }
+  if (t.dataset.reviewAll !== undefined) {
+    return changeApps(async () => {
+      for (const app of appList.filter((a) => !a.reviewed)) await putApp(app.app_id, app.category_id);
+    });
+  }
 });
 
 window.addEventListener("kidtime:tab", (e) => {
-  if (e.detail === "rules") renderRules().catch(() => {});
-  if (e.detail === "apps") renderApps().catch(() => {});
+  if (e.detail === "rules") renderRules();
+  if (e.detail === "apps") renderApps();
 });
 
 // Keep the "new apps" badge current without opening the tab

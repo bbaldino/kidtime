@@ -1,6 +1,6 @@
-// Network first; fall back to the last cached copy so the app still opens
-// (showing the last known status) when the server can't be reached.
-const CACHE = "kidtime-v2";
+// Network first; fall back to the last cached copy so the app still opens when the server can't be
+// reached. API answers are never cached: the page must be able to tell that it has no fresh data.
+const CACHE = "kidtime-v3";
 const SHELL = ["/", "/app.js", "/manage.js", "/style.css", "/manifest.webmanifest", "/icon.svg", "/icon-192.png"];
 
 self.addEventListener("install", (e) => {
@@ -16,7 +16,7 @@ self.addEventListener("activate", (e) => {
 });
 
 self.addEventListener("fetch", (e) => {
-  if (e.request.method !== "GET") return;
+  if (e.request.method !== "GET" || new URL(e.request.url).pathname.startsWith("/api/")) return;
   e.respondWith(
     fetch(e.request)
       .then((res) => {
