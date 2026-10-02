@@ -150,6 +150,8 @@ pub(crate) fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/api/report", post(report))
+        // Unmatched paths rely on the protected sub-router's layered fallback surviving this merge;
+        // the login test in api.rs pins that
         .merge(behind_login)
         .with_state(state)
 }

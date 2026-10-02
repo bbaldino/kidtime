@@ -542,12 +542,25 @@ mod tests {
             ("PUT", "/api/apps/x"),
             ("GET", "/api/categories"),
             ("GET", "/api/events"),
+            // Unmatched paths and wrong methods must not reveal anything either
+            ("GET", "/api/nope"),
+            ("GET", "/a/b/c"),
+            ("POST", "/api/status"),
+            ("DELETE", "/"),
+            ("HEAD", "/api/status"),
+            ("OPTIONS", "/api/status"),
         ] {
             let (status, body) = call(&app, method, uri, None).await;
             assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {uri}");
             assert_eq!(body, Value::Null, "{method} {uri} must have an empty body");
         }
         assert_eq!(call(&app, "GET", "/healthz", None).await.0, StatusCode::OK);
+        // The open paths answer other methods with 405 and an empty body
+        for (method, uri) in [("GET", "/api/report"), ("POST", "/healthz")] {
+            let (status, body) = call(&app, method, uri, None).await;
+            assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "{method} {uri}");
+            assert_eq!(body, Value::Null, "{method} {uri} must have an empty body");
+        }
         report(&app, "steam:1").await;
     }
 }
