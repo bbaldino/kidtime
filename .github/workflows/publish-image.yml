@@ -1,0 +1,84 @@
+name: publish-image
+
+# Tags ONLY — deliberately not `branches: [main]`.
+#
+# Triggering on both meant a release commit was built twice: once when the
+# release PR merged to main, once when the bot tagged that same commit. Two
+# builds of identical source, two digests, and both runs emitted sha-<short>,
+# which then landed on whichever finished last — nondeterminism in the one tag
+# whose entire purpose is identifying an exact build.
+#
+# Tag-only gives one build per release, every tag written exactly once, and
+# sha-<short> pointing at the same digest as the version tags. The cost is no
+# image for commits that are never released — which, with release filtering,
+# means docs/ci/chore commits. Those are exactly the changes you would not
+# deploy.
+#
+# Tests still run on every push to main: the release workflow triggers there and
+# gates on the same reusable test job.
+on:
+  push:
+    tags: ['v*.*.*']
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    uses: ./.github/workflows/test.yml
+
+  publish:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          # No `type=raw,value=latest,...` rule here. metadata-action's default
+          # `flavor: latest=auto` already applies latest to non-prerelease
+          # semver tags, which is exactly what is wanted. A raw rule would set
+          # latest unconditionally — including on any non-release run — which is
+          # how latest ends up meaning "whatever built most recently".
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            # Deliberately unrestricted. This workflow only ever runs on a tag,
+            # so sha-<short> is emitted once, by the same build that emits the
+            # version tags — all four share one digest.
+            #
+            # Do NOT add enable={{is_default_branch}} here. Under tag-only
+            # triggering it is not redundant, it is actively wrong: the run is
+            # never on the default branch, so the condition is always false and
+            # sha-<short> is never emitted at all. You get the version tags, no
+            # sha- tag, and no error — the same silent-failure shape as the bug
+            # this replaced. If you are migrating a workflow that carries that
+            # flag, removing it is load-bearing, not cleanup.
+            type=sha,prefix=sha-
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          sbom: false
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
