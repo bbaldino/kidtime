@@ -288,7 +288,12 @@ mod tests {
             end: at(0, 0) + Days::new(2),
             note: String::new(),
         };
-        let d = decide(&day(&[(375, 1200)]), std::slice::from_ref(&span), &none(), at(22, 0));
+        let d = decide(
+            &day(&[(375, 1200)]),
+            std::slice::from_ref(&span),
+            &none(),
+            at(22, 0),
+        );
         assert_eq!(
             d.computer,
             Computer::Blackout {
