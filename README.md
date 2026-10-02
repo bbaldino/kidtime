@@ -67,11 +67,11 @@ sudo ./target/release/kidtime-agent --config deploy/agent.toml.example --dump
 ```sh
 echo "KIDTIME_AGENT_TOKEN=$(openssl rand -hex 24)" > .env
 echo "TZ=America/New_York" >> .env    # your time zone
-docker compose up -d --build          # or: podman-compose up -d --build
+docker compose up -d                  # pulls ghcr.io/bbaldino/kidtime
 curl http://localhost:8470/healthz    # -> ok
 ```
 
-It listens on 8470, keeps its database in the `kidtime-data` volume (`/data`), and
+It listens on 8470, keeps its database in `./data` next to `compose.yaml`, and
 counts days in the `TZ` from `.env`, which must match the kids' computers.
 Configuration comes from environment variables: `KIDTIME_AGENT_TOKEN` (required),
 `KIDTIME_LISTEN`, `KIDTIME_DB`.

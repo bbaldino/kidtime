@@ -4,3 +4,5 @@
 dev/agent.dev.toml
 CLAUDE.local.md
 .env
+/data
+handoff.md

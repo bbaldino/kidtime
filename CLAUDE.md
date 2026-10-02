@@ -111,8 +111,20 @@ Agent config: see `deploy/agent.toml.example`. A streaming host sets `streaming_
     since its policy on the dev machine blocks SVG input).
   - **Installing it on a phone needs HTTPS** (a reverse proxy in front of :8470).
 - `Dockerfile`: multi-stage, `rust:1-bookworm` → `gcr.io/distroless/cc-debian12:nonroot` (uid 65532).
-  `/data` is created owned by 65532 so a fresh named volume is writable. Also `compose.yaml` and `.dockerignore`.
-  **The image has never been built** (no docker/podman on the dev machine).
+  `/data` is created owned by 65532 so a fresh named volume is writable. Also `.dockerignore`.
+- `compose.yaml` runs the published image `ghcr.io/bbaldino/kidtime:<X.Y.Z>` (always an exact version).
+  - Data is a bind mount, `./data`, so host backups of the compose directory include the database.
+  - **One-time step on a new host:** `chown 65532:65532 data`. Docker creates a bind directory owned by
+    root, and the server then fails with "unable to open database file". A one-shot init service would
+    fix it too, but Komodo reports a stack with an exited container as not running.
+  - The port is published (`8470:8470`): the reverse proxy forwards to the host's IP, not to a Docker network.
+  - Built and run locally with Docker (2026-10-01): 28.8 MB image, about 2.4 MiB of memory when idle.
+- **Releases** (`.github/workflows/`): release-please keeps one version for the whole repo in `version.txt`,
+  from conventional commits (`feat:`/`fix:` cut a release). The tag `vX.Y.Z` triggers `publish-image.yml`,
+  which pushes the image to GHCR. Both workflows run `test.yml` first (nightly fmt, clippy `-D warnings`, tests).
+  - The crate versions in `Cargo.toml` are not the release version. Don't read `CARGO_PKG_VERSION` as it.
+  - Integrate with squash or rebase, never a merge commit: release-please only reads first-parent history.
+  - Needs the repo secret `RELEASE_BOT_TOKEN`. With the default token, the tag would not trigger the image build.
 - `deploy/` has systemd units for both binaries (the server unit: `DynamicUser`, `StateDirectory`,
   `LoadCredential` for the config), plus example configs.
 
@@ -151,14 +163,14 @@ Run `cargo test` (all pass) and `cargo clippy --all-targets` (clean). Tests cove
 
 - Verified on a real streaming host: session states, desktop app names, Steam and shortcut names,
   stream connected vs idle, and Sway focus naming for streams.
-- Not yet tried for real: cross-host de-duplication (needs a second PC reporting), the container build,
-  and the PWA over HTTPS.
+- Not yet tried for real: cross-host de-duplication (needs a second PC reporting), the release
+  workflows on GitHub, and the PWA over HTTPS.
 - Nothing is deployed yet. timekpr still enforces.
 
 ## Next steps
 
-1. Build and run the server container (see `CLAUDE.local.md` for the target).
-   Generate the token with `openssl rand -hex 24`.
+1. Publish the first image (seed tag `v0.1.0`), then run the server container (see `CLAUDE.local.md`
+   for the target). Generate the token with `openssl rand -hex 24`.
 2. HTTPS reverse proxy → :8470. Then install the PWA on a phone.
 3. Install the agents (as root, via the systemd unit, config mode 600), with streaming settings on the streaming host.
 4. Run for a few days and check the numbers against reality.

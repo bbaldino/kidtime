@@ -1,19 +1,36 @@
-# docker compose up -d --build
-# Put these in a .env file next to this one:
+# docker compose up -d
+# Put these in a .env file next to this one (or in the deploy tool's environment):
 #   KIDTIME_AGENT_TOKEN=...   (openssl rand -hex 24)
 #   TZ=America/New_York       (the kids' computers' time zone; days are counted in it)
+#
+# To run a local build instead of the published image:
+#   docker build -t ghcr.io/bbaldino/kidtime:0.1.0 . && docker compose up -d
 services:
   kidtime:
-    build: .
-    image: kidtime-server
+    # Pin an exact release. `latest` exists, but a deployment should not follow it.
+    image: ghcr.io/bbaldino/kidtime:0.1.0
     restart: unless-stopped
     ports:
       - "8470:8470"
     environment:
-      KIDTIME_AGENT_TOKEN: ${KIDTIME_AGENT_TOKEN:?set KIDTIME_AGENT_TOKEN in .env}
-      TZ: ${TZ:?set TZ in .env to the kids' computers' time zone}
+      KIDTIME_AGENT_TOKEN: ${KIDTIME_AGENT_TOKEN:?set KIDTIME_AGENT_TOKEN}
+      TZ: ${TZ:?set TZ to the kids' computers' time zone}
     volumes:
-      - kidtime-data:/data
-
-volumes:
-  kidtime-data:
+      # A bind mount next to this file rather than a named volume, so the
+      # database sits where host backups of the compose directory pick it up.
+      #
+      # ONE-TIME STEP on a new host: Docker creates ./data owned by root, but the
+      # server runs as uid 65532 (distroless nonroot) and then exits with "unable
+      # to open database file". Fix the owner once; it survives redeploys:
+      #   mkdir -p data && sudo chown 65532:65532 data
+      # (Not done by a one-shot init service, because deploy tools such as Komodo
+      # report a stack with an exited container as not running.)
+      - ./data:/data
+    # The server idles at a few MiB. The limit is there so a leak kills this
+    # container rather than something else on the host.
+    mem_limit: 128m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
