@@ -1,6 +1,7 @@
 //! kidtime-server: collects agent reports and serves the dashboard.
 
 mod db;
+mod rules;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
