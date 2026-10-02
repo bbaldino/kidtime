@@ -1,7 +1,7 @@
 // Network first; fall back to the last cached copy so the app still opens
 // (showing the last known status) when the server can't be reached.
-const CACHE = "kidtime-v1";
-const SHELL = ["/", "/app.js", "/style.css", "/manifest.webmanifest", "/icon.svg", "/icon-192.png"];
+const CACHE = "kidtime-v2";
+const SHELL = ["/", "/app.js", "/manage.js", "/style.css", "/manifest.webmanifest", "/icon.svg", "/icon-192.png"];
 
 self.addEventListener("install", (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()));

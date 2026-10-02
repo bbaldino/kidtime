@@ -23,6 +23,75 @@ const ICONS = {
 
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
 
+// Every API call goes through here. Behind the login proxy an expired session is a redirect to another
+// origin, which fetch can't follow usefully; treat it like a 401 and reload into the login.
+async function api(path, { method = "GET", body } = {}) {
+  const res = await fetch(path, {
+    method,
+    cache: "no-store",
+    redirect: "manual",
+    headers: body === undefined ? undefined : { "Content-Type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  if (res.status === 401 || res.type === "opaqueredirect") {
+    location.reload();
+    throw new Error("signed out");
+  }
+  if (res.status === 422 || res.status === 400) {
+    // Our own validation answers with JSON; the framework's rejection of a malformed request is plain text
+    const text = await res.text();
+    let problem = null;
+    try { problem = JSON.parse(text); } catch {}
+    throw Object.assign(new Error(problem?.error || text || `HTTP ${res.status}`), { field: problem?.field });
+  }
+  if (!res.ok) throw new Error(res.statusText || `HTTP ${res.status}`);
+  return res.status === 204 ? null : res.json();
+}
+
+let categories = [];
+const categoryName = (id) => categories.find((c) => c.id === id)?.name ?? "Uncategorised";
+
+function clock(text) {
+  // "2026-10-05T20:00:00" is the server's local time; show it as written
+  const [date, time] = text.split("T");
+  const [h, m] = time.split(":").map(Number);
+  const label = `${h % 12 || 12}:${String(m).padStart(2, "0")}${h < 12 ? "am" : "pm"}`;
+  const today = new Date();
+  const todayText = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}-${String(today.getDate()).padStart(2, "0")}`;
+  if (date === todayText) return label;
+  return `${parseDay(date).toLocaleDateString(undefined, { weekday: "short" })} ${label}`;
+}
+
+function decisionHtml(u) {
+  if (!u.restricted || !u.decision) return "";
+  const d = u.decision;
+  let line;
+  if (d.computer.state === "allowed") {
+    // next_change is not always the moment the state flips, so only name a time when it isn't just midnight
+    const midnight = d.next_change.split("T")[1] === "00:00:00";
+    line = !d.next_change || midnight ? "Allowed" : `Allowed until ${esc(clock(d.next_change))}`;
+  } else if (d.computer.state === "blackout") line = `Would be locked: blackout until ${esc(clock(d.computer.until))}${d.computer.note ? ` (${esc(d.computer.note)})` : ""}`;
+  else line = "Would be locked: outside allowed hours";
+  const budgets = d.categories.map((c) => c.used_up
+    ? `<li><strong>${esc(categoryName(c.category))}</strong> budget used up</li>`
+    : `<li><strong>${esc(categoryName(c.category))}</strong> ${duration(c.left_secs)} left</li>`).join("");
+  return `<div class="decision"><p>${line}</p>${budgets ? `<ul>${budgets}</ul>` : ""}</div>`;
+}
+
+const EVENT_TEXT = {
+  locked: (e) => `Would have locked: ${e.detail}`,
+  closed: (e) => `Would have closed ${e.detail.toLowerCase()}: ${e.detail} budget used up`,
+  allowed: () => "Allowed again",
+};
+
+function eventsHtml(events) {
+  if (!events.length) return '<li class="empty-note">Nothing yet.</li>';
+  return events.map((e) => {
+    const when = new Date(e.at * 1000).toLocaleString(undefined, { weekday: "short", hour: "numeric", minute: "2-digit" });
+    return `<li><span class="event-when">${esc(when)}</span> <span class="event-who">${esc(e.user)}</span> ${esc((EVENT_TEXT[e.kind] ?? (() => e.kind))(e))}</li>`;
+  }).join("");
+}
+
 function duration(secs) {
   const m = Math.floor(secs / 60);
   if (m < 60) return `${m}m`;
@@ -84,6 +153,7 @@ function cardHtml(u) {
         <div><span class="hero-value">${duration(u.today_secs)}</span><span class="hero-label">today</span></div>
         <div><span class="hero-secondary">${duration(u.week_secs)}</span><span class="hero-label">last 7 days</span></div>
       </div>
+      ${decisionHtml(u)}
       ${running.length ? `<ul class="running" aria-label="Running now">${running.map((a) => `<li>${esc(a)}</li>`).join("")}</ul>` : ""}
       <h3 class="section-title">Apps today</h3>
       ${appsHtml(u)}
@@ -124,13 +194,14 @@ const updatedEl = document.getElementById("updated");
 
 async function refresh() {
   try {
-    const res = await fetch("/api/status", { cache: "no-store" });
-    if (!res.ok) throw new Error(res.statusText);
-    const status = await res.json();
+    const [status, events] = await Promise.all([api("/api/status"), api("/api/events")]);
+    if (!categories.length) categories = await api("/api/categories");
     hideTip();
     usersEl.innerHTML = status.users.length
       ? status.users.map(cardHtml).join("")
       : '<article class="card"><p class="empty-note">No activity reported yet. Is an agent running?</p></article>';
+    document.getElementById("events").innerHTML = eventsHtml(events);
+    window.kidtimeUsers = status.users.map((u) => u.user);
     updatedEl.classList.remove("error");
     updatedEl.textContent = `Updated ${new Date(status.generated_at * 1000).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`;
   } catch {
@@ -138,6 +209,17 @@ async function refresh() {
     updatedEl.textContent = "Can't reach server";
   }
 }
+
+const tabs = [...document.querySelectorAll(".tab")];
+function showTab(name) {
+  for (const t of tabs) {
+    const on = t.dataset.tab === name;
+    if (on) t.setAttribute("aria-current", "page"); else t.removeAttribute("aria-current");
+    document.getElementById(`tab-${t.dataset.tab}`).hidden = !on;
+  }
+  window.dispatchEvent(new CustomEvent("kidtime:tab", { detail: name }));
+}
+for (const t of tabs) t.addEventListener("click", () => showTab(t.dataset.tab));
 
 refresh();
 setInterval(() => { if (!document.hidden) refresh(); }, REFRESH_MS);

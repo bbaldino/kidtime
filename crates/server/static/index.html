@@ -19,8 +19,25 @@
     <h1>Kidtime</h1>
     <p class="updated" id="updated" aria-live="polite">Loading…</p>
   </header>
-  <main id="users" class="users"></main>
+  <nav class="tabs" aria-label="Sections">
+    <button type="button" class="tab" data-tab="today" aria-current="page">Today</button>
+    <button type="button" class="tab" data-tab="rules">Rules</button>
+    <button type="button" class="tab" data-tab="apps">Apps <span id="apps-new" class="badge" hidden></span></button>
+  </nav>
+  <main>
+    <section id="tab-today">
+      <div id="users" class="users"></div>
+      <section class="card log">
+        <h2>What the rules would have done</h2>
+        <p class="footnote">Nothing is enforced yet. This shows when kidtime would have acted.</p>
+        <ul id="events" class="events"></ul>
+      </section>
+    </section>
+    <section id="tab-rules" hidden></section>
+    <section id="tab-apps" hidden></section>
+  </main>
   <div id="tooltip" class="tooltip" role="tooltip" hidden></div>
   <script src="/app.js"></script>
+  <script src="/manage.js"></script>
 </body>
 </html>

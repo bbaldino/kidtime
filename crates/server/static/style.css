@@ -200,3 +200,40 @@ body {
   position: absolute; width: 1px; height: 1px; overflow: hidden;
   clip: rect(0 0 0 0); white-space: nowrap;
 }
+
+.tabs { display: flex; gap: 4px; max-width: 960px; margin: 0 auto; padding: 0 0 12px; }
+main { max-width: 960px; margin: 0 auto; }
+.tab {
+  flex: 1; padding: 8px 10px; border: 1px solid var(--track); border-radius: 8px;
+  background: transparent; color: var(--text-secondary); font: inherit;
+}
+.tab[aria-current="page"] { background: var(--track); color: var(--text-primary); font-weight: 600; }
+.badge { display: inline-block; padding: 0 6px; border-radius: 9px; font-size: 0.7rem; font-weight: 600; border: 1px solid currentColor; }
+.decision { margin: 12px 0 0; font-size: 0.9rem; color: var(--text-primary); }
+.decision p, .decision ul { margin: 0; }
+.decision ul { list-style: none; padding: 0; color: var(--text-secondary); }
+.log { margin: 12px 0 0; }
+.log h2, .card > h2 { font-size: 1rem; margin: 0; }
+.events, .week-rules, .blackouts, .apps, .stretches { list-style: none; margin: 8px 0 0; padding: 0; display: grid; gap: 8px; }
+.events li { font-size: 0.875rem; color: var(--text-secondary); }
+.event-when { font-variant-numeric: tabular-nums; }
+.event-who { color: var(--text-primary); font-weight: 600; text-transform: capitalize; }
+#tab-rules, #tab-apps { padding: 0; display: grid; gap: 12px; }
+.chips { display: flex; gap: 6px; flex-wrap: wrap; }
+.chip { padding: 6px 12px; border: 1px solid var(--track); border-radius: 16px; background: transparent; color: var(--text-secondary); font: inherit; text-transform: capitalize; }
+.chip[aria-pressed="true"] { background: var(--track); color: var(--text-primary); font-weight: 600; }
+.day-row { display: flex; justify-content: space-between; gap: 12px; width: 100%; padding: 10px 0; border: 0; border-bottom: 1px solid var(--track); background: transparent; color: inherit; font: inherit; text-align: left; }
+.day-name { font-weight: 600; }
+.day-summary { color: var(--text-secondary); text-align: right; }
+.editor { display: grid; gap: 10px; padding: 10px 0; }
+.editor label { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.editor input, .editor select, .editor button, .app-row select { font: inherit; padding: 6px 8px; min-height: 36px; }
+.editor-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.stretch-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.form-error { margin: 0; color: var(--text-primary); font-weight: 600; }
+.form-error::before { content: "⚠ "; }
+.blackouts li, .app-row { display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; }
+.app-seen { color: var(--text-muted); font-size: 0.8rem; }
+
+/* Author display rules above would otherwise beat the hidden attribute */
+[hidden] { display: none !important; }
