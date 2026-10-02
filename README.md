@@ -67,6 +67,7 @@ sudo ./target/release/kidtime-agent --config deploy/agent.toml.example --dump
 ```sh
 echo "KIDTIME_AGENT_TOKEN=$(openssl rand -hex 24)" > .env
 echo "TZ=America/New_York" >> .env    # your time zone
+mkdir -p data && sudo chown 65532:65532 data   # the server runs as uid 65532
 docker compose up -d                  # pulls ghcr.io/bbaldino/kidtime
 curl http://localhost:8470/healthz    # -> ok
 ```
@@ -89,11 +90,15 @@ sudo firewall-cmd --permanent --add-port=8470/tcp && sudo firewall-cmd --reload
 **Agent** (every kid computer):
 
 ```sh
-sudo install -m755 target/release/kidtime-agent /usr/local/bin/
-sudo install -Dm600 deploy/agent.toml.example /etc/kidtime/agent.toml     # set server_url, token, users
-sudo install -m644 deploy/kidtime-agent.service /etc/systemd/system/
-sudo systemctl enable --now kidtime-agent
+cargo build --release -p agent
+sudo deploy/install-agent.sh --server http://SERVER-HOST:8470 --users kid1,kid2
 ```
+
+The script asks for the agent token, checks the server and the token, writes
+`/etc/kidtime/agent.toml` (mode 600), installs the binary and the systemd unit, and
+shows what the agent sees. Add `--streaming` on a machine that hosts Sunshine
+streaming sessions, and `--host NAME` if the machine's hostname is unset. Run it again
+with no options to upgrade the binary. See `deploy/agent.toml.example` for all settings.
 
 If the server can't be reached, the agent queues up to a day of samples and sends them later.
 

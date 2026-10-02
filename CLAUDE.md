@@ -125,6 +125,9 @@ Agent config: see `deploy/agent.toml.example`. A streaming host sets `streaming_
   - The crate versions in `Cargo.toml` are not the release version. Don't read `CARGO_PKG_VERSION` as it.
   - Integrate with squash or rebase, never a merge commit: release-please only reads first-parent history.
   - Needs the repo secret `RELEASE_BOT_TOKEN`. With the default token, the tag would not trigger the image build.
+- `deploy/install-agent.sh` (sudo) installs or upgrades the agent on a kid PC: it asks for the token,
+  checks the server and the token, writes the config, installs the binary and unit, and prints the
+  agent's view. `KIDTIME_INSTALL_ROOT=<dir>` installs under a fake root and skips systemd, for testing.
 - `deploy/` has systemd units for both binaries (the server unit: `DynamicUser`, `StateDirectory`,
   `LoadCredential` for the config), plus example configs.
 
@@ -165,16 +168,15 @@ Run `cargo test` (all pass) and `cargo clippy --all-targets` (clean). Tests cove
   stream connected vs idle, and Sway focus naming for streams.
 - Not yet tried for real: cross-host de-duplication (needs a second PC reporting), the release
   workflows on GitHub, and the PWA over HTTPS.
-- Nothing is deployed yet. timekpr still enforces.
+- Deployed 2026-10-02: the server container (image `0.1.0`) and the agent on both kid PCs, all reporting.
+  timekpr still enforces.
 
 ## Next steps
 
-1. Publish the first image (seed tag `v0.1.0`), then run the server container (see `CLAUDE.local.md`
-   for the target). Generate the token with `openssl rand -hex 24`.
-2. HTTPS reverse proxy → :8470. Then install the PWA on a phone.
-3. Install the agents (as root, via the systemd unit, config mode 600), with streaming settings on the streaming host.
-4. Run for a few days and check the numbers against reality.
-5. Then:
+1. Done: the image is published, the server runs, and the agents are installed (see `CLAUDE.local.md`).
+2. Install the PWA on a phone from the HTTPS address.
+3. Run for a few days and check the numbers against reality.
+4. Then:
    - **dashboard auth** (needed before any controls; the dashboard is read-only and unauthenticated now);
    - **enforcement**: allowed hours per weekday, daily budgets across machines (union time), blackout dates,
      "+30 min" / "lock now" from the phone, warnings via `notify-send` into the kid's session, locking via
