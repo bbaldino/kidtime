@@ -105,7 +105,9 @@ If the server can't be reached, the agent queues up to a day of samples and send
 
 ## Dashboard on a phone
 
-Open `http://SERVER-HOST:8470` in a mobile browser. It works over plain HTTP.
+Open `http://SERVER-HOST:8470` in a mobile browser. It works over plain HTTP, but only while the
+login check is off: with it on, the dashboard answers only through the reverse proxy that does the
+login (see "Who can see and change things").
 
 Installing it as an app (a PWA) needs **HTTPS**, because browsers only allow
 service workers on secure origins. The easiest options on a home network:

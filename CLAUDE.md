@@ -16,7 +16,8 @@ A Cargo workspace (edition 2024) with three crates:
 - `crates/agent`: the binary `kidtime-agent`. It runs as **root** on each kid PC, as a systemd system service.
 - `crates/server`: the binary `kidtime-server`. It runs axum + rusqlite (bundled SQLite) and serves the dashboard.
   The dashboard's static files are compiled in with `include_bytes!`. Source files in `crates/server/src/`:
-  - `main.rs`: config, `router()` and the report handler. Only `POST /api/report` and `GET /healthz` are outside the login middleware.
+  - `main.rs`: config, `router()`, the report handler, the status handler and the daily prune task.
+    Only `POST /api/report` and `GET /healthz` are outside the login middleware.
   - `db.rs`: all storage.
   - `rules.rs`: rule types, validation, and the pure `decide` function. No I/O.
   - `auth.rs`: verifies the reverse proxy's signed login token, caches its keys, and holds the login middleware.
@@ -40,14 +41,19 @@ A Cargo workspace (edition 2024) with three crates:
   - `account(user, last_seen)` lists the accounts that have reported, so the Rules tab knows who to show.
   - `category(id, name)` holds app categories. `Games` (id 1) is created on first start.
   - `app(app_id, name, first_seen, last_seen, category_id, set_by_person, reviewed)` holds every app seen and its category.
-  - `app_activity(user, host, app_id, start, end)` holds one interval per app per counted sample.
+  - `app_activity(user, host, app_id, start, end)` holds merged stretches per user, host and app: a counted
+    sample extends the app's latest stretch when it starts where that one ends, and otherwise starts a new one.
     Category time is worked out from it when asked, so recategorising an app applies to the whole day.
   - `day_rule(user, weekday, restricted)` marks a weekday as restricted. Weekday 0 is Monday.
   - `stretch(user, weekday, start_min, end_min)` holds the allowed hours of a restricted day, as minutes
     after local midnight. A restricted day with no stretches means not allowed that day.
   - `budget(user, weekday, category_id, minutes)` holds a daily budget for one category.
   - `blackout(id, user, start, end, note)` holds one-off blocked spans. `user` NULL means every restricted account.
-  - `event(id, user, at, key, kind, detail)` is the log of what the rules decided (shown on the Today tab).
+  - `event(id, user, at, key, kind, detail)` is the would-have log (shown on the Today tab). A report logs
+    decisions only for accounts in use in its latest sample (`active` or `streaming`). "allowed" is logged
+    only when nothing is blocked or used up; other easings are kept as rows of kind `state`, which are never shown.
+  - Reported names (account, host, app id, app name) are clipped to 200 characters, apps with an empty id
+    are skipped, and at most 50 apps per user per sample are recorded.
   - A daily task deletes `app_activity` and `event` rows older than 30 days.
 - `GET /api/status` returns JSON for the dashboard:
   - each user's headline state and the host it's on;
@@ -173,8 +179,11 @@ Run `cargo test` (all pass) and `cargo clippy --all-targets` (clean). Tests cove
 - server: samples counted once (retries and restarts), idle not counted, and overlapping hosts counted once;
 - the decision function (`rules::decide`);
 - category time from `app_activity`;
-- login token verification;
-- the API, including that the login check covers every route.
+- which decision changes the would-have log shows, and that it only covers accounts in use;
+- clipping of reported names, skipping of apps without an id, and the cap on apps per sample;
+- login token verification, including missing claims, the HTTPS-only team URL, and the once-a-minute
+  limit on key fetches (503 without keys);
+- the API, including that the login check covers every route, and that a blackout already over is refused.
 
 ## Dev helpers (`dev/`)
 
@@ -204,7 +213,8 @@ Run `cargo test` (all pass) and `cargo clippy --all-targets` (clean). Tests cove
 - Not yet tried for real: cross-host de-duplication (needs a second PC reporting), the release
   workflows on GitHub, and the PWA over HTTPS.
 - Rules, API and login check: covered by automated tests, and the Today, Rules and Apps screens were checked
-  by hand in a browser. None of it is deployed. Session expiry behind the real proxy has not been tried.
+  by hand in a browser, including failed saves and loads with the server stopped. The start-up key fetch
+  has only run in tests, never against a real identity provider. None of it is deployed. Session expiry behind the real proxy has not been tried.
 - Deployed 2026-10-02: the server container (image `0.1.0`) and the agent on both kid PCs, all reporting.
   timekpr still enforces.
 
