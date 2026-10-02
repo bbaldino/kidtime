@@ -15,7 +15,7 @@ use protocol::{Report, UserState};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-use crate::rules::{self, BlackoutSpan, CategoryId, DayRule, Decision, Stretch};
+use crate::rules::{self, BlackoutSpan, CategoryId, Computer, DayRule, Decision, Stretch};
 
 /// The one category created at first start.
 pub const GAMES: CategoryId = 1;
@@ -41,6 +41,37 @@ pub struct Blackout {
     pub start: NaiveDateTime,
     pub end: NaiveDateTime,
     pub note: String,
+}
+
+/// A change in what the rules say for an account. Nothing is enforced yet, so these record what
+/// would have happened.
+#[allow(dead_code)]
+#[derive(Debug, Serialize)]
+pub struct Event {
+    pub id: i64,
+    pub user: String,
+    pub at: i64,
+    /// "locked", "closed" or "allowed".
+    pub kind: String,
+    pub detail: String,
+}
+
+const KEEP_SECS: i64 = 30 * 86400;
+const ALLOWED_KEY: &str = "allowed|";
+
+fn decision_key(decision: &Decision) -> String {
+    let computer = match &decision.computer {
+        Computer::Allowed => "allowed",
+        Computer::OutsideSchedule => "outside_schedule",
+        Computer::Blackout { .. } => "blackout",
+    };
+    let used_up: Vec<String> = decision
+        .categories
+        .iter()
+        .filter(|c| c.used_up)
+        .map(|c| c.category.to_string())
+        .collect();
+    format!("{computer}|{}", used_up.join(","))
 }
 
 /// How local date-times are stored; this form sorts correctly as text.
@@ -156,7 +187,16 @@ impl Db {
                  start TEXT NOT NULL,
                  end   TEXT NOT NULL,
                  note  TEXT NOT NULL
-             );",
+             );
+             CREATE TABLE IF NOT EXISTS event (
+                 id     INTEGER PRIMARY KEY,
+                 user   TEXT NOT NULL,
+                 at     INTEGER NOT NULL,
+                 key    TEXT NOT NULL,
+                 kind   TEXT NOT NULL,
+                 detail TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS event_user_id ON event (user, id);",
         )?;
         Ok(Self { conn })
     }
@@ -588,6 +628,92 @@ impl Db {
         let used = self.category_secs(user, now.date())?;
         Ok(rules::decide(&rule, &spans, &used, now))
     }
+
+    /// Adds an event if the decision differs from the account's last logged one.
+    #[allow(dead_code)]
+    pub fn log_decision(&mut self, user: &str, at: i64, decision: &Decision) -> Result<bool> {
+        let key = decision_key(decision);
+        let last: String = self
+            .conn
+            .query_row(
+                "SELECT key FROM event WHERE user = ?1 ORDER BY id DESC LIMIT 1",
+                [user],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or_else(|| ALLOWED_KEY.to_string());
+        if key == last {
+            return Ok(false);
+        }
+        let (last_computer, last_used_up) = last.split_once('|').unwrap_or((&last, ""));
+        let (computer, _) = key.split_once('|').unwrap_or((&key, ""));
+
+        let (kind, detail) = if computer != "allowed" && computer != last_computer {
+            let detail = match &decision.computer {
+                Computer::Blackout { note, .. } if !note.is_empty() => {
+                    format!("blackout: {note}")
+                }
+                Computer::Blackout { .. } => "blackout".to_string(),
+                _ => "outside schedule".to_string(),
+            };
+            ("locked", detail)
+        } else {
+            let before: Vec<&str> = last_used_up.split(',').collect();
+            let names = self.categories()?;
+            let name_of = |id: CategoryId| {
+                names
+                    .iter()
+                    .find(|(known, _)| *known == id)
+                    .map_or_else(|| id.to_string(), |(_, name)| name.clone())
+            };
+            let newly: Vec<String> = decision
+                .categories
+                .iter()
+                .filter(|c| c.used_up && !before.contains(&c.category.to_string().as_str()))
+                .map(|c| name_of(c.category))
+                .collect();
+            if newly.is_empty() {
+                ("allowed", String::new())
+            } else {
+                ("closed", newly.join(", "))
+            }
+        };
+        self.conn.execute(
+            "INSERT INTO event (user, at, key, kind, detail) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![user, at, key, kind, detail],
+        )?;
+        Ok(true)
+    }
+
+    /// Newest first.
+    #[allow(dead_code)]
+    pub fn events(&self, user: Option<&str>, limit: u32) -> Result<Vec<Event>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, user, at, kind, detail FROM event WHERE ?1 IS NULL OR user = ?1 ORDER BY id DESC LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![user, limit], |r| {
+                Ok(Event {
+                    id: r.get(0)?,
+                    user: r.get(1)?,
+                    at: r.get(2)?,
+                    kind: r.get(3)?,
+                    detail: r.get(4)?,
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    /// Drops per-app stretches and events older than 30 days. Daily totals are kept.
+    #[allow(dead_code)]
+    pub fn prune(&mut self, now: i64) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM app_activity WHERE end < ?1", [now - KEEP_SECS])?;
+        self.conn
+            .execute("DELETE FROM event WHERE at < ?1", [now - KEEP_SECS])?;
+        Ok(())
+    }
 }
 
 /// Unix time of local midnight at the start of `day`.
@@ -971,7 +1097,7 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
     }
 
-    use crate::rules::{Computer, DayRule, Stretch};
+    use crate::rules::{CategoryStatus, Computer, DayRule, Decision, Stretch};
 
     fn noon_today() -> chrono::NaiveDateTime {
         Local::now().date_naive().and_hms_opt(12, 0, 0).unwrap()
@@ -1120,6 +1246,107 @@ mod tests {
         let d = db.decision("kid1", noon_today()).unwrap();
         assert_eq!(d.categories[0].used_secs, 60);
         assert!(d.categories[0].used_up);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    fn decision_of(computer: Computer, used_up: &[CategoryId]) -> Decision {
+        Decision {
+            computer,
+            categories: used_up
+                .iter()
+                .map(|&category| CategoryStatus {
+                    category,
+                    used_secs: 60,
+                    left_secs: 0,
+                    used_up: true,
+                })
+                .collect(),
+            next_change: noon_today(),
+        }
+    }
+
+    #[test]
+    fn events_are_logged_once_per_change() {
+        let (mut db, path) = temp_db("events");
+        let allowed = decision_of(Computer::Allowed, &[]);
+        let outside = decision_of(Computer::OutsideSchedule, &[]);
+        let blackout = decision_of(
+            Computer::Blackout {
+                until: noon_today(),
+                note: "dinner".into(),
+            },
+            &[],
+        );
+        let games_gone = decision_of(Computer::Allowed, &[GAMES]);
+
+        // Nothing to say about an account that starts out allowed
+        assert!(!db.log_decision("kid1", 100, &allowed).unwrap());
+        assert!(db.log_decision("kid1", 110, &outside).unwrap());
+        assert!(!db.log_decision("kid1", 120, &outside).unwrap());
+        assert!(db.log_decision("kid1", 130, &blackout).unwrap());
+        assert!(db.log_decision("kid1", 140, &allowed).unwrap());
+        assert!(db.log_decision("kid1", 150, &games_gone).unwrap());
+        assert!(db.log_decision("kid2", 160, &outside).unwrap());
+
+        let all = db.events(None, 50).unwrap();
+        assert_eq!(all.len(), 5);
+        assert_eq!(all[0].user, "kid2");
+        let kid1 = db.events(Some("kid1"), 50).unwrap();
+        let seen: Vec<(&str, &str)> = kid1
+            .iter()
+            .rev()
+            .map(|e| (e.kind.as_str(), e.detail.as_str()))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                ("locked", "outside schedule"),
+                ("locked", "blackout: dinner"),
+                ("allowed", ""),
+                ("closed", "Games")
+            ]
+        );
+        assert_eq!(db.events(Some("kid1"), 2).unwrap().len(), 2);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn prune_removes_rows_older_than_thirty_days() {
+        let (mut db, path) = temp_db("prune");
+        let now = start_of_test();
+        let old = now - 31 * 86400;
+        db.record(&sample_report(
+            "host-a",
+            1,
+            old,
+            UserState::Active,
+            &[("steam:1", "Minecraft")],
+        ))
+        .unwrap();
+        db.record(&sample_report(
+            "host-a",
+            2,
+            now,
+            UserState::Active,
+            &[("steam:1", "Minecraft")],
+        ))
+        .unwrap();
+        db.log_decision("kid1", old, &decision_of(Computer::OutsideSchedule, &[]))
+            .unwrap();
+        db.log_decision("kid1", now, &decision_of(Computer::Allowed, &[]))
+            .unwrap();
+
+        db.prune(now).unwrap();
+        let count = |table: &str| -> i64 {
+            db.conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(count("app_activity"), 1);
+        assert_eq!(count("event"), 1);
+        // Totals don't depend on the pruned tables
+        // Two days, each with a host total and one app
+        assert_eq!(count("usage"), 4);
         std::fs::remove_file(&path).unwrap();
     }
 }
