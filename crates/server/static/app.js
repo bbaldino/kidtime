@@ -68,7 +68,7 @@ function decisionHtml(u) {
   let line;
   if (d.computer.state === "allowed") {
     // next_change is not always the moment the state flips, so only name a time when it isn't just midnight
-    const midnight = d.next_change.split("T")[1] === "00:00:00";
+    const midnight = d.next_change?.split("T")[1] === "00:00:00";
     line = !d.next_change || midnight ? "Allowed" : `Allowed until ${esc(clock(d.next_change))}`;
   } else if (d.computer.state === "blackout") line = `Would be locked: blackout until ${esc(clock(d.computer.until))}${d.computer.note ? ` (${esc(d.computer.note)})` : ""}`;
   else line = "Would be locked: outside allowed hours";
