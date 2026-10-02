@@ -1,7 +1,12 @@
 // Network first; fall back to the last cached copy so the app still opens when the server can't be
 // reached. API answers are never cached: the page must be able to tell that it has no fresh data.
-const CACHE = "kidtime-v3";
-const SHELL = ["/", "/app.js", "/manage.js", "/style.css", "/manifest.webmanifest", "/icon.svg", "/icon-192.png"];
+// The server fills in the stamp below from the scripts' and stylesheet's content, so every release
+// gets its own cache and its own script addresses.
+const CACHE = "kidtime-__ASSETS__";
+const SHELL = [
+  "/", "/app.js?v=__ASSETS__", "/manage.js?v=__ASSETS__", "/style.css?v=__ASSETS__",
+  "/manifest.webmanifest", "/icon.svg", "/icon-192.png",
+];
 
 self.addEventListener("install", (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()));

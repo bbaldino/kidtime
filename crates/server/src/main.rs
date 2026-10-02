@@ -429,28 +429,44 @@ async fn asset_owned(file: String) -> Response {
     asset(&file).await
 }
 
+const APP_JS: &[u8] = include_bytes!("../static/app.js");
+const MANAGE_JS: &[u8] = include_bytes!("../static/manage.js");
+const STYLE_CSS: &[u8] = include_bytes!("../static/style.css");
+
+/// The page and the service worker with `__ASSETS__` replaced by a stamp of the scripts' and
+/// stylesheet's content.
+///
+/// A browser or a proxy in front of the server may keep `/app.js` for longer than `no-cache` asks.
+/// Naming the files `/app.js?v=<stamp>` means a page from a new release can never be paired with a
+/// script from an old one.
+struct Stamped {
+    index_html: Vec<u8>,
+    sw_js: Vec<u8>,
+}
+
+fn stamped() -> &'static Stamped {
+    static STAMPED: std::sync::OnceLock<Stamped> = std::sync::OnceLock::new();
+    STAMPED.get_or_init(|| {
+        use std::hash::{Hash, Hasher};
+        // Not for security: it only has to change when a file changes
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        (APP_JS, MANAGE_JS, STYLE_CSS).hash(&mut hasher);
+        let stamp = format!("{:016x}", hasher.finish());
+        let fill = |text: &str| text.replace("__ASSETS__", &stamp).into_bytes();
+        Stamped {
+            index_html: fill(include_str!("../static/index.html")),
+            sw_js: fill(include_str!("../static/sw.js")),
+        }
+    })
+}
+
 async fn asset(file: &str) -> Response {
     let (body, content_type): (&'static [u8], &str) = match file {
-        "index.html" => (
-            include_bytes!("../static/index.html"),
-            "text/html; charset=utf-8",
-        ),
-        "app.js" => (
-            include_bytes!("../static/app.js"),
-            "text/javascript; charset=utf-8",
-        ),
-        "manage.js" => (
-            include_bytes!("../static/manage.js"),
-            "text/javascript; charset=utf-8",
-        ),
-        "style.css" => (
-            include_bytes!("../static/style.css"),
-            "text/css; charset=utf-8",
-        ),
-        "sw.js" => (
-            include_bytes!("../static/sw.js"),
-            "text/javascript; charset=utf-8",
-        ),
+        "index.html" => (&stamped().index_html, "text/html; charset=utf-8"),
+        "app.js" => (APP_JS, "text/javascript; charset=utf-8"),
+        "manage.js" => (MANAGE_JS, "text/javascript; charset=utf-8"),
+        "style.css" => (STYLE_CSS, "text/css; charset=utf-8"),
+        "sw.js" => (&stamped().sw_js, "text/javascript; charset=utf-8"),
         "manifest.webmanifest" => (
             include_bytes!("../static/manifest.webmanifest"),
             "application/manifest+json",

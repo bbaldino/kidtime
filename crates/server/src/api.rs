@@ -558,6 +558,55 @@ mod tests {
         assert_eq!(body["error"], "a blackout must end in the future");
     }
 
+    async fn text(app: &TestApp, uri: &str) -> String {
+        let request = Request::builder().uri(uri).body(Body::empty()).unwrap();
+        let response = router(app.state.clone()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        String::from_utf8(
+            response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap()
+    }
+
+    /// A browser or proxy may keep `/app.js` longer than the server asks. The page therefore names
+    /// its scripts and stylesheet with a stamp that changes whenever their content does, so a new
+    /// page can never run an old script.
+    #[tokio::test]
+    async fn the_page_and_service_worker_name_assets_with_a_content_stamp() {
+        let app = app("stamp");
+        let page = text(&app, "/").await;
+        let stamp = page
+            .split("/app.js?v=")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("the page loads app.js with a stamp");
+        assert!(
+            stamp.len() >= 8 && stamp.chars().all(|c| c.is_ascii_hexdigit()),
+            "{stamp}"
+        );
+        for asset in ["/manage.js", "/style.css"] {
+            assert!(page.contains(&format!("{asset}?v={stamp}\"")), "{asset}");
+        }
+        assert!(!page.contains("__ASSETS__"));
+
+        let worker = text(&app, "/sw.js").await;
+        assert!(!worker.contains("__ASSETS__"));
+        assert!(worker.contains(&format!("kidtime-{stamp}")));
+        assert!(worker.contains(&format!("/app.js?v={stamp}")));
+
+        // The stamped address serves the same file
+        assert_eq!(
+            text(&app, &format!("/app.js?v={stamp}")).await,
+            text(&app, "/app.js").await
+        );
+    }
+
     #[tokio::test]
     async fn with_the_login_check_on_only_report_and_health_are_open() {
         use crate::auth::{AccessConfig, Auth};
