@@ -20,7 +20,6 @@ use crate::rules::{self, BlackoutSpan, CategoryId, Computer, DayRule, Decision, 
 /// The one category created at first start.
 pub const GAMES: CategoryId = 1;
 
-#[allow(dead_code)]
 #[derive(Debug, Serialize)]
 pub struct AppEntry {
     pub app_id: String,
@@ -33,7 +32,6 @@ pub struct AppEntry {
 }
 
 /// A one-off blackout. `user: None` applies to every restricted account.
-#[allow(dead_code)]
 #[derive(Debug, Serialize)]
 pub struct Blackout {
     pub id: i64,
@@ -45,7 +43,6 @@ pub struct Blackout {
 
 /// A change in what the rules say for an account. Nothing is enforced yet, so these record what
 /// would have happened.
-#[allow(dead_code)]
 #[derive(Debug, Serialize)]
 pub struct Event {
     pub id: i64,
@@ -383,7 +380,6 @@ impl Db {
     }
 
     /// The catalogue: apps nobody has looked at first, then the most recently seen.
-    #[allow(dead_code)]
     pub fn apps(&self) -> Result<Vec<AppEntry>> {
         let mut stmt = self.conn.prepare(
             "SELECT app_id, name, first_seen, last_seen, category_id, set_by_person, reviewed
@@ -406,7 +402,6 @@ impl Db {
     }
 
     /// A person's choice of category (or none). Returns false if the app is unknown.
-    #[allow(dead_code)]
     pub fn set_app_category(
         &mut self,
         app_id: &str,
@@ -419,7 +414,6 @@ impl Db {
         Ok(changed > 0)
     }
 
-    #[allow(dead_code)]
     pub fn categories(&self) -> Result<Vec<(CategoryId, String)>> {
         let mut stmt = self
             .conn
@@ -430,7 +424,6 @@ impl Db {
         Ok(rows)
     }
 
-    #[allow(dead_code)]
     pub fn is_account(&self, user: &str) -> Result<bool> {
         Ok(self.conn.query_row(
             "SELECT EXISTS (SELECT 1 FROM account WHERE user = ?1)",
@@ -441,7 +434,6 @@ impl Db {
 
     /// Seconds on `day` during which the user had an app of each category in use, on any host.
     /// Categories with no time are left out.
-    #[allow(dead_code)]
     pub fn category_secs(&self, user: &str, day: NaiveDate) -> Result<BTreeMap<CategoryId, i64>> {
         let (day_start, day_end) = (midnight(day), midnight(day + Days::new(1)));
         let mut stmt = self.conn.prepare(
@@ -473,7 +465,6 @@ impl Db {
             .collect())
     }
 
-    #[allow(dead_code)]
     pub fn day_rule(&self, user: &str, weekday: u8) -> Result<DayRule> {
         let restricted = self
             .conn
@@ -509,13 +500,11 @@ impl Db {
     }
 
     /// Monday first.
-    #[allow(dead_code)]
     pub fn week_rules(&self, user: &str) -> Result<Vec<DayRule>> {
         (0..7).map(|weekday| self.day_rule(user, weekday)).collect()
     }
 
     /// Replaces the weekday's rule. The caller validates it first.
-    #[allow(dead_code)]
     pub fn set_day_rule(&mut self, user: &str, weekday: u8, rule: &DayRule) -> Result<()> {
         let tx = self.conn.transaction()?;
         tx.execute(
@@ -553,7 +542,6 @@ impl Db {
     }
 
     /// Whether the account has any rule: a restricted day or a budget.
-    #[allow(dead_code)]
     pub fn is_restricted(&self, user: &str) -> Result<bool> {
         Ok(self.conn.query_row(
             "SELECT EXISTS (SELECT 1 FROM day_rule WHERE user = ?1 AND restricted = 1)
@@ -563,7 +551,6 @@ impl Db {
         )?)
     }
 
-    #[allow(dead_code)]
     pub fn add_blackout(
         &mut self,
         user: Option<&str>,
@@ -578,7 +565,6 @@ impl Db {
         Ok(self.conn.last_insert_rowid())
     }
 
-    #[allow(dead_code)]
     pub fn delete_blackout(&mut self, id: i64) -> Result<bool> {
         Ok(self
             .conn
@@ -587,7 +573,6 @@ impl Db {
     }
 
     /// Blackouts that haven't ended at `now`, earliest start first.
-    #[allow(dead_code)]
     pub fn blackouts(&self, now: NaiveDateTime) -> Result<Vec<Blackout>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, user, start, end, note FROM blackout WHERE end > ?1 ORDER BY start, id",
@@ -607,7 +592,6 @@ impl Db {
     }
 
     /// What the rules say for the account at `now`.
-    #[allow(dead_code)]
     pub fn decision(&self, user: &str, now: NaiveDateTime) -> Result<Decision> {
         let weekday = now.date().weekday().num_days_from_monday() as u8;
         let rule = self.day_rule(user, weekday)?;
@@ -630,7 +614,6 @@ impl Db {
     }
 
     /// Adds an event if the decision differs from the account's last logged one.
-    #[allow(dead_code)]
     pub fn log_decision(&mut self, user: &str, at: i64, decision: &Decision) -> Result<bool> {
         let key = decision_key(decision);
         let last: String = self
@@ -686,7 +669,6 @@ impl Db {
     }
 
     /// Newest first.
-    #[allow(dead_code)]
     pub fn events(&self, user: Option<&str>, limit: u32) -> Result<Vec<Event>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, user, at, kind, detail FROM event WHERE ?1 IS NULL OR user = ?1 ORDER BY id DESC LIMIT ?2",
@@ -706,7 +688,6 @@ impl Db {
     }
 
     /// Drops per-app stretches and events older than 30 days. Daily totals are kept.
-    #[allow(dead_code)]
     pub fn prune(&mut self, now: i64) -> Result<()> {
         self.conn
             .execute("DELETE FROM app_activity WHERE end < ?1", [now - KEEP_SECS])?;

@@ -3,9 +3,6 @@
 //! Only the signature is trusted. Plain identity headers are ignored, because the server can also be
 //! reached without going through the proxy.
 
-// Nothing uses this module until the middleware is attached to the router.
-#![allow(dead_code)]
-
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -100,6 +97,7 @@ impl Auth {
         }
     }
 
+    #[cfg(test)]
     pub fn with_keys(config: AccessConfig, keys: JwkSet) -> Self {
         Self {
             config,

@@ -13,7 +13,7 @@ reqwest = { version = "0.13.5", default-features = false, features = ["json", "r
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "signal", "net"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "signal", "net", "time"] }
 toml = "1.1.6"
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
@@ -24,4 +24,6 @@ path = "src/main.rs"
 
 [dev-dependencies]
 base64 = "0.23.1"
+http-body-util = "0.1.5"
 rsa = "0.9.10"
+tower = { version = "0.5.3", features = ["util"] }

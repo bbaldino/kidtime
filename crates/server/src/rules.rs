@@ -1,5 +1,4 @@
 //! Rule types and the decision function. No I/O: callers supply the rules, usage and time.
-#![allow(dead_code)]
 
 use std::collections::BTreeMap;
 

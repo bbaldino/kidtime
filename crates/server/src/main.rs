@@ -1,5 +1,6 @@
 //! kidtime-server: collects agent reports and serves the dashboard.
 
+mod api;
 mod auth;
 mod db;
 mod rules;
@@ -47,17 +48,16 @@ fn default_db() -> PathBuf {
     "/var/lib/kidtime/kidtime.db".into()
 }
 
-struct AppState {
-    db: Mutex<db::Db>,
-    agent_token: String,
+pub(crate) struct AppState {
+    pub(crate) db: Mutex<db::Db>,
+    pub(crate) agent_token: String,
     /// Latest sample from each host, for the live view.
-    live: Mutex<HashMap<String, LiveHost>>,
+    pub(crate) live: Mutex<HashMap<String, LiveHost>>,
     /// None when the login check is off.
-    #[allow(dead_code)]
-    auth: Option<Arc<auth::Auth>>,
+    pub(crate) auth: Option<Arc<auth::Auth>>,
 }
 
-struct LiveHost {
+pub(crate) struct LiveHost {
     received_at: i64,
     interval_secs: u32,
     users: Vec<UserSample>,
@@ -95,16 +95,18 @@ async fn main() -> Result<()> {
         auth,
     });
 
-    let app = Router::new()
-        .route("/healthz", get(|| async { "ok" }))
-        .route("/api/report", post(report))
-        .route("/api/status", get(status))
-        .route("/", get(|| asset("index.html")))
-        .route(
-            "/{file}",
-            get(|axum::extract::Path(file): axum::extract::Path<String>| asset_owned(file)),
-        )
-        .with_state(state);
+    let pruner = state.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(86400));
+        loop {
+            tick.tick().await;
+            if let Err(e) = pruner.db.lock().unwrap().prune(now()) {
+                tracing::error!("pruning old rows: {e:#}");
+            }
+        }
+    });
+
+    let app = router(state);
 
     let listener = tokio::net::TcpListener::bind(&config.listen)
         .await
@@ -114,6 +116,42 @@ async fn main() -> Result<()> {
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     Ok(())
+}
+
+/// Everything except the agents' endpoint and the health check sits behind the login check.
+pub(crate) fn router(state: Arc<AppState>) -> Router {
+    use axum::routing::{delete, put};
+
+    let behind_login = Router::new()
+        .route("/api/status", get(status))
+        .route("/api/rules/{user}", get(api::get_rules))
+        .route("/api/rules/{user}/copy", post(api::copy_rule))
+        .route("/api/rules/{user}/{weekday}", put(api::put_rule))
+        .route(
+            "/api/blackouts",
+            get(api::get_blackouts).post(api::post_blackout),
+        )
+        .route("/api/blackouts/{id}", delete(api::delete_blackout))
+        .route("/api/apps", get(api::get_apps))
+        .route("/api/apps/{id}", put(api::put_app))
+        .route("/api/categories", get(api::get_categories))
+        .route("/api/events", get(api::get_events))
+        .route("/", get(|| asset("index.html")))
+        .route(
+            "/{file}",
+            get(|axum::extract::Path(file): axum::extract::Path<String>| asset_owned(file)),
+        )
+        // The login check runs before any handler's extractors, so a bad body can't answer before it
+        .layer(axum::middleware::from_fn_with_state(
+            state.auth.clone(),
+            auth::require_login,
+        ));
+
+    Router::new()
+        .route("/healthz", get(|| async { "ok" }))
+        .route("/api/report", post(report))
+        .merge(behind_login)
+        .with_state(state)
 }
 
 fn load_config(path: Option<PathBuf>) -> Result<Config> {
@@ -183,9 +221,29 @@ async fn report(
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
-    if let Err(e) = state.db.lock().unwrap().record(&report) {
-        tracing::error!("recording report from {}: {e:#}", report.host);
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    {
+        let mut db = state.db.lock().unwrap();
+        if let Err(e) = db.record(&report) {
+            tracing::error!("recording report from {}: {e:#}", report.host);
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+        let now_local = Local::now().naive_local();
+        let mut users: Vec<&str> = report
+            .samples
+            .iter()
+            .flat_map(|s| s.users.iter().map(|u| u.user.as_str()))
+            .collect();
+        users.sort_unstable();
+        users.dedup();
+        for user in users {
+            // A failure here must not make the agent resend a report that was already recorded
+            let logged = db
+                .decision(user, now_local)
+                .and_then(|d| db.log_decision(user, now(), &d));
+            if let Err(e) = logged {
+                tracing::error!("logging the decision for {user}: {e:#}");
+            }
+        }
     }
     if let Some(latest) = report.samples.last() {
         state.live.lock().unwrap().insert(
@@ -220,6 +278,10 @@ struct UserStatus {
     hosts_today: Vec<NamedSecs>,
     /// Oldest first, ending today.
     days: Vec<NamedSecs>,
+    /// Whether the account has any rule.
+    restricted: bool,
+    /// None if it couldn't be worked out; the other accounts are still returned.
+    decision: Option<rules::Decision>,
 }
 
 #[derive(Serialize)]
@@ -309,7 +371,16 @@ async fn status(State(state): State<Arc<AppState>>) -> Result<Json<Status>, Stat
             })
             .collect();
 
+        let now_local = Local::now().naive_local();
+        let decision = db
+            .decision(&name, now_local)
+            .inspect_err(|e| tracing::error!("decision for {name}: {e:#}"))
+            .ok();
+        let restricted = db.is_restricted(&name).map_err(internal)?;
+
         users.push(UserStatus {
+            restricted,
+            decision,
             state,
             host,
             today_secs: days.last().map_or(0, |d| d.secs),
@@ -352,6 +423,10 @@ async fn asset(file: &str) -> Response {
         ),
         "app.js" => (
             include_bytes!("../static/app.js"),
+            "text/javascript; charset=utf-8",
+        ),
+        "manage.js" => (
+            include_bytes!("../static/manage.js"),
             "text/javascript; charset=utf-8",
         ),
         "style.css" => (
