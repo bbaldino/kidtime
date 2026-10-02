@@ -7,7 +7,7 @@ across machines. The results show up on a web dashboard that works on phones.
   records each tracked user's state and running apps, and sends that to the server.
 - **`kidtime-server`** stores usage in SQLite and serves the dashboard.
 
-This version only tracks usage. It doesn't enforce anything, so timekpr keeps
+This version tracks usage and holds the rules, but it doesn't enforce anything, so timekpr keeps
 handling schedules for now.
 
 ## What counts as usage
@@ -75,7 +75,8 @@ curl http://localhost:8470/healthz    # -> ok
 It listens on 8470, keeps its database in `./data` next to `compose.yaml`, and
 counts days in the `TZ` from `.env`, which must match the kids' computers.
 Configuration comes from environment variables: `KIDTIME_AGENT_TOKEN` (required),
-`KIDTIME_LISTEN`, `KIDTIME_DB`.
+`KIDTIME_LISTEN`, `KIDTIME_DB`, and the login check's `KIDTIME_ACCESS_TEAM` and
+`KIDTIME_ACCESS_AUD` (see "Who can see and change things").
 
 **Server as a systemd service** (alternative, without containers):
 
@@ -115,12 +116,29 @@ service workers on secure origins. The easiest options on a home network:
 
 After that, use "Add to Home Screen" (iOS Safari) or "Install app" (Android Chrome).
 
+## Rules
+
+The dashboard has three tabs.
+
+- **Today** shows each kid's usage, what the rules say right now, and a log of what kidtime would have done.
+  Nothing is enforced on the computers yet.
+- **Rules** sets, per kid and per weekday, the allowed hours and a games budget, plus one-off blackouts.
+- **Apps** lists every app seen and its category. Only apps in the Games category use the games budget.
+
+## Who can see and change things
+
+Without the login check, anyone who can reach the server can read and change everything. To turn it on,
+put the server behind a reverse proxy that authenticates people and adds a signed token to each request
+(Cloudflare Access does), and set `KIDTIME_ACCESS_TEAM` and `KIDTIME_ACCESS_AUD`. The server then verifies
+that token itself, so reaching its port directly doesn't get around the login. The agents' endpoint and
+`/healthz` stay open; the agents use their own token.
+
 ## Known gaps / next steps
 
-- **No dashboard login yet.** It's read-only for now. Add auth before adding controls.
 - **Streaming detection** checks whether the user's `sunshine` process is using
   the GPU video encoder: the `drm-engine-enc` counter in `/proc/<pid>/fdinfo`
   goes up only while it's encoding a stream. This needs root. If the counter
   can't be read, streamed games count as usage.
 - **Focus tracking:** a GNOME Shell extension that reports the focused app over D-Bus.
-- **Enforcement:** schedules, budgets, locking, and "+30 min" from the dashboard, to replace timekpr.
+- **Enforcement:** the rules are stored and evaluated, but nothing acts on them yet. Next: closing apps
+  and locking sessions, and "+30 min" from the dashboard, to replace timekpr.

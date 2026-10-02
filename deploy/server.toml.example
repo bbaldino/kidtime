@@ -5,3 +5,9 @@ db = "/var/lib/kidtime/kidtime.db"
 
 # Must match `token` in every agent.toml. Generate one with: openssl rand -hex 24
 agent_token = "CHANGE-ME"
+
+# Login check. Set both to make the server verify the signed token an authenticating reverse proxy
+# adds to each request (header Cf-Access-Jwt-Assertion). Then only the agents' endpoint and /healthz
+# answer without a login. Leave both unset only for local development.
+# access_team = "https://TEAM.cloudflareaccess.com"
+# access_aud = "APPLICATION-AUDIENCE-TAG"

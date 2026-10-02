@@ -15,6 +15,9 @@ services:
     environment:
       KIDTIME_AGENT_TOKEN: ${KIDTIME_AGENT_TOKEN:?set KIDTIME_AGENT_TOKEN}
       TZ: ${TZ:?set TZ to the kids' computers' time zone}
+      # Login check (see README). Both empty or unset turns it off; set both in production.
+      KIDTIME_ACCESS_TEAM: ${KIDTIME_ACCESS_TEAM:-}
+      KIDTIME_ACCESS_AUD: ${KIDTIME_ACCESS_AUD:-}
     volumes:
       # A bind mount next to this file rather than a named volume, so the
       # database sits where host backups of the compose directory pick it up.

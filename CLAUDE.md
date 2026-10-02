@@ -15,7 +15,12 @@ A Cargo workspace (edition 2024) with three crates:
 - `crates/protocol`: the wire types shared by agent and server (`Report`, `Sample`, `UserSample`, `UserState`, `App`).
 - `crates/agent`: the binary `kidtime-agent`. It runs as **root** on each kid PC, as a systemd system service.
 - `crates/server`: the binary `kidtime-server`. It runs axum + rusqlite (bundled SQLite) and serves the dashboard.
-  The dashboard's static files are compiled in with `include_bytes!`.
+  The dashboard's static files are compiled in with `include_bytes!`. Source files in `crates/server/src/`:
+  - `main.rs`: config, `router()` and the report handler. Only `POST /api/report` and `GET /healthz` are outside the login middleware.
+  - `db.rs`: all storage.
+  - `rules.rs`: rule types, validation, and the pure `decide` function. No I/O.
+  - `auth.rs`: verifies the reverse proxy's signed login token, caches its keys, and holds the login middleware.
+  - `api.rs`: JSON handlers for rules, blackouts, apps, categories and events.
 
 ### Data flow
 
@@ -32,11 +37,29 @@ A Cargo workspace (edition 2024) with three crates:
   - `activity(user, host, start, end)` holds one row per counted sample. **Daily totals are the *union* of
     intervals across hosts**, so streaming from one machine to another doesn't count twice.
   - `agents(host, agent_id, last_seq)` drops samples the server has already recorded.
+  - `account(user, last_seen)` lists the accounts that have reported, so the Rules tab knows who to show.
+  - `category(id, name)` holds app categories. `Games` (id 1) is created on first start.
+  - `app(app_id, name, first_seen, last_seen, category_id, set_by_person, reviewed)` holds every app seen and its category.
+  - `app_activity(user, host, app_id, start, end)` holds one interval per app per counted sample.
+    Category time is worked out from it when asked, so recategorising an app applies to the whole day.
+  - `day_rule(user, weekday, restricted)` marks a weekday as restricted. Weekday 0 is Monday.
+  - `stretch(user, weekday, start_min, end_min)` holds the allowed hours of a restricted day, as minutes
+    after local midnight. A restricted day with no stretches means not allowed that day.
+  - `budget(user, weekday, category_id, minutes)` holds a daily budget for one category.
+  - `blackout(id, user, start, end, note)` holds one-off blocked spans. `user` NULL means every restricted account.
+  - `event(id, user, at, key, kind, detail)` is the log of what the rules decided (shown on the Today tab).
+  - A daily task deletes `app_activity` and `event` rows older than 30 days.
 - `GET /api/status` returns JSON for the dashboard:
   - each user's headline state and the host it's on;
   - live sessions for each host (a host is treated as offline after 3× its interval without a report);
   - today's and the last 7 days' totals;
-  - apps today and hosts today.
+  - apps today and hosts today;
+  - whether the account has any rule, and its current decision from `rules::decide`.
+- The rules API (`crates/server/src/api.rs`), all behind the login: `/api/rules/{user}` (and `/{weekday}`,
+  `/copy`), `/api/blackouts`, `/api/apps`, `/api/categories`, `/api/events`. Invalid input gets 422 with
+  `{"error", "field"}`.
+- Nothing is enforced on the PCs yet: the response to `/api/report` carries no decisions, and the event log
+  shows what would have happened.
 - `GET /healthz` returns `ok`.
 - **Plan for enforcement:** the server's *response* to `/api/report` will carry decisions
   ("12 minutes left", "lock now"), so agents keep making a single call. The business logic lives
@@ -99,8 +122,16 @@ Agent config: see `deploy/agent.toml.example`. A streaming host sets `streaming_
 - Config comes from an optional TOML file (`--config`, or `/etc/kidtime/server.toml` if it exists),
   overridden by the environment: `KIDTIME_AGENT_TOKEN` (required), `KIDTIME_LISTEN`
   (default `0.0.0.0:8470`), `KIDTIME_DB`. Shuts down cleanly on SIGTERM.
+- **Login check:** `access_team` / `KIDTIME_ACCESS_TEAM` (the identity provider's URL, also the token's issuer)
+  and `access_aud` / `KIDTIME_ACCESS_AUD` (the application's audience tag).
+  - Both set: the server verifies the signed token in the `Cf-Access-Jwt-Assertion` header on every request.
+    **Only `/api/report` and `/healthz` answer without a login**, static files included; a missing or
+    invalid token gets 401 with an empty body. If the keys can't be fetched, the answer is 503, never open access.
+  - Neither set: the check is off, with a warning at start-up. Exactly one set: start-up error.
+    Empty strings count as unset.
 - Days are counted in the server's local time zone, so `TZ` for the container must match the kids' PCs.
 - The dashboard (`crates/server/static/`) is vanilla JS with no build step. It polls `/api/status` every 10s.
+  It has three tabs: Today, Rules and Apps. The Rules and Apps tabs are in `manage.js`.
   - Designed for phones first, with two columns on wide screens and separate light and dark colors.
   - Each kid gets a card: a status pill (icon plus label, never color alone), a big "today" number,
     "last 7 days", chips for what's running now, per-app bars (top 6 plus "N others"), a 7-day column chart
@@ -139,7 +170,11 @@ Run `cargo test` (all pass) and `cargo clippy --all-targets` (clean). Tests cove
 - VDF and binary shortcuts;
 - the stream lifecycle (paused → start → ongoing → stop → resume);
 - Sway focus and app naming;
-- server: samples counted once (retries and restarts), idle not counted, and overlapping hosts counted once.
+- server: samples counted once (retries and restarts), idle not counted, and overlapping hosts counted once;
+- the decision function (`rules::decide`);
+- category time from `app_activity`;
+- login token verification;
+- the API, including that the login check covers every route.
 
 ## Dev helpers (`dev/`)
 
@@ -168,6 +203,8 @@ Run `cargo test` (all pass) and `cargo clippy --all-targets` (clean). Tests cove
   stream connected vs idle, and Sway focus naming for streams.
 - Not yet tried for real: cross-host de-duplication (needs a second PC reporting), the release
   workflows on GitHub, and the PWA over HTTPS.
+- Rules, API and login check: covered by automated tests, and the Today, Rules and Apps screens were checked
+  by hand in a browser. None of it is deployed. Session expiry behind the real proxy has not been tried.
 - Deployed 2026-10-02: the server container (image `0.1.0`) and the agent on both kid PCs, all reporting.
   timekpr still enforces.
 
@@ -177,16 +214,17 @@ Run `cargo test` (all pass) and `cargo clippy --all-targets` (clean). Tests cove
 2. Install the PWA on a phone from the HTTPS address.
 3. Run for a few days and check the numbers against reality.
 4. Then:
-   - **dashboard auth** (needed before any controls; the dashboard is read-only and unauthenticated now);
-   - **enforcement**: allowed hours per weekday, daily budgets across machines (union time), blackout dates,
-     "+30 min" / "lock now" from the phone, warnings via `notify-send` into the kid's session, locking via
-     logind `Session.Lock()`, and offline fallback in the agent. Then retire timekpr.
+   - **dashboard auth**: done (the login check).
+   - **enforcement**: the rules, budgets and blackouts exist and are evaluated, but nothing acts on them.
+     Planned behaviour: a used-up budget closes that category's apps; the schedule or a blackout locks the
+     session. Still to do: "+30 min" / "lock now" from the phone, warnings via `notify-send` into the kid's
+     session, locking via logind `Session.Lock()`, and offline fallback in the agent. Then retire timekpr.
    - a **GNOME Shell extension** reporting the focused window over D-Bus. Desktop app time is currently
      "running while active" rather than focus. This also fixes a known gap: **non-Steam games on a GNOME
      desktop (e.g. Battle.net games) aren't detected at all** — no app scope and no SteamLaunch.
      Install it system-wide and lock it on with dconf.
    - Possibly: idle detection for an *unattended but connected* stream (input activity on the passthrough
-     devices; gamepads need care), and retention/pruning of `activity` rows.
+     devices; gamepads need care), and pruning of `activity` rows (`app_activity` and `event` are already pruned).
 
 ## Design decisions to keep
 
@@ -196,4 +234,6 @@ Run `cargo test` (all pass) and `cargo clippy --all-targets` (clean). Tests cove
 - Daily totals are the union of intervals across hosts; per-host and per-app breakdowns stay as plain sums.
 - Window titles are only used to name apps in streaming sessions (mostly games). Think about privacy before
   recording titles on desktops (e.g. browser page titles).
+- Budgets count one category of apps; category time is worked out from per-app stretches when asked, so
+  recategorising applies to the whole day.
 - Tracking is per account. If kids use a parent's account, that time isn't attributed to them.
