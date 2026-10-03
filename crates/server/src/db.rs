@@ -580,35 +580,20 @@ impl Db {
     /// Replaces the weekday's rule. The caller validates it first.
     pub fn set_day_rule(&mut self, user: &str, weekday: u8, rule: &DayRule) -> Result<()> {
         let tx = self.conn.transaction()?;
-        tx.execute(
-            "DELETE FROM day_rule WHERE user = ?1 AND weekday = ?2",
-            params![user, weekday],
-        )?;
-        tx.execute(
-            "DELETE FROM stretch WHERE user = ?1 AND weekday = ?2",
-            params![user, weekday],
-        )?;
-        tx.execute(
-            "DELETE FROM budget WHERE user = ?1 AND weekday = ?2",
-            params![user, weekday],
-        )?;
-        if rule.restricted {
-            tx.execute(
-                "INSERT INTO day_rule (user, weekday, restricted) VALUES (?1, ?2, 1)",
-                params![user, weekday],
-            )?;
-            for s in &rule.stretches {
-                tx.execute(
-                    "INSERT INTO stretch (user, weekday, start_min, end_min) VALUES (?1, ?2, ?3, ?4)",
-                    params![user, weekday, s.start_min, s.end_min],
-                )?;
+        write_day_rule(&tx, user, weekday, rule)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Replaces each target account's whole week with `from`'s, in one transaction. The caller
+    /// checks that the accounts exist.
+    pub fn copy_week(&mut self, from: &str, to: &[String]) -> Result<()> {
+        let week = self.week_rules(from)?;
+        let tx = self.conn.transaction()?;
+        for user in to {
+            for (weekday, rule) in (0..).zip(&week) {
+                write_day_rule(&tx, user, weekday, rule)?;
             }
-        }
-        for (category, minutes) in &rule.budgets {
-            tx.execute(
-                "INSERT INTO budget (user, weekday, category_id, minutes) VALUES (?1, ?2, ?3, ?4)",
-                params![user, weekday, category, minutes],
-            )?;
         }
         tx.commit()?;
         Ok(())
@@ -775,6 +760,46 @@ impl Db {
             .execute("DELETE FROM event WHERE at < ?1", [now - KEEP_SECS])?;
         Ok(())
     }
+}
+
+/// Replaces one weekday's rule inside a transaction the caller commits.
+fn write_day_rule(
+    tx: &rusqlite::Transaction,
+    user: &str,
+    weekday: u8,
+    rule: &DayRule,
+) -> Result<()> {
+    tx.execute(
+        "DELETE FROM day_rule WHERE user = ?1 AND weekday = ?2",
+        params![user, weekday],
+    )?;
+    tx.execute(
+        "DELETE FROM stretch WHERE user = ?1 AND weekday = ?2",
+        params![user, weekday],
+    )?;
+    tx.execute(
+        "DELETE FROM budget WHERE user = ?1 AND weekday = ?2",
+        params![user, weekday],
+    )?;
+    if rule.restricted {
+        tx.execute(
+            "INSERT INTO day_rule (user, weekday, restricted) VALUES (?1, ?2, 1)",
+            params![user, weekday],
+        )?;
+        for s in &rule.stretches {
+            tx.execute(
+                "INSERT INTO stretch (user, weekday, start_min, end_min) VALUES (?1, ?2, ?3, ?4)",
+                params![user, weekday, s.start_min, s.end_min],
+            )?;
+        }
+    }
+    for (category, minutes) in &rule.budgets {
+        tx.execute(
+            "INSERT INTO budget (user, weekday, category_id, minutes) VALUES (?1, ?2, ?3, ?4)",
+            params![user, weekday, category, minutes],
+        )?;
+    }
+    Ok(())
 }
 
 /// Unix time of local midnight at the start of `day`.
@@ -1280,6 +1305,49 @@ mod tests {
         db.set_day_rule("kid1", 0, &DayRule::default()).unwrap();
         assert_eq!(db.day_rule("kid1", 0).unwrap(), DayRule::default());
         assert!(!db.is_restricted("kid1").unwrap());
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn copy_week_replaces_the_targets_whole_week() {
+        let (mut db, path) = temp_db("copy-week");
+        let evenings = DayRule {
+            restricted: true,
+            stretches: vec![Stretch {
+                start_min: 375,
+                end_min: 1260,
+            }],
+            budgets: BTreeMap::from([(GAMES, 60)]),
+        };
+        // kid1: Monday and Saturday set, the rest unrestricted
+        db.set_day_rule("kid1", 0, &evenings).unwrap();
+        db.set_day_rule(
+            "kid1",
+            5,
+            &DayRule {
+                budgets: BTreeMap::from([(GAMES, 120)]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // kid2 has a Wednesday rule that kid1 doesn't: it must not survive the copy
+        db.set_day_rule("kid2", 2, &evenings).unwrap();
+        let other = DayRule {
+            restricted: true,
+            stretches: vec![],
+            budgets: BTreeMap::new(),
+        };
+        db.set_day_rule("kid3", 4, &other).unwrap();
+
+        db.copy_week("kid1", &["kid2".to_string()]).unwrap();
+        assert_eq!(
+            db.week_rules("kid2").unwrap(),
+            db.week_rules("kid1").unwrap()
+        );
+        assert_eq!(db.day_rule("kid2", 2).unwrap(), DayRule::default());
+        // Untouched: the source and anyone not named
+        assert_eq!(db.day_rule("kid1", 0).unwrap(), evenings);
+        assert_eq!(db.day_rule("kid3", 4).unwrap(), other);
         std::fs::remove_file(&path).unwrap();
     }
 

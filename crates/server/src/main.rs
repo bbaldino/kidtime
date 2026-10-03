@@ -130,6 +130,7 @@ pub(crate) fn router(state: Arc<AppState>) -> Router {
         .route("/api/status", get(status))
         .route("/api/rules/{user}", get(api::get_rules))
         .route("/api/rules/{user}/copy", post(api::copy_rule))
+        .route("/api/rules/{user}/copy-to", post(api::copy_week))
         .route("/api/rules/{user}/{weekday}", put(api::put_rule))
         .route(
             "/api/blackouts",

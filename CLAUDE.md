@@ -63,7 +63,7 @@ A Cargo workspace (edition 2024) with three crates:
   - apps today and hosts today;
   - whether the account has any rule, and its current decision from `rules::decide`.
 - The rules API (`crates/server/src/api.rs`), all behind the login: `/api/rules/{user}` (and `/{weekday}`,
-  `/copy`), `/api/blackouts`, `/api/apps`, `/api/categories`, `/api/events`. Invalid input gets 422 with
+  `/copy`, `/copy-to` for whole weeks to other accounts), `/api/blackouts`, `/api/apps`, `/api/categories`, `/api/events`. Invalid input gets 422 with
   `{"error", "field"}`.
 - Nothing is enforced on the PCs yet: the response to `/api/report` carries no decisions, and the event log
   shows what would have happened.

@@ -126,10 +126,19 @@ async function renderRules(focusSel, message) {
   const picker = users.map((u) => `<button type="button" class="chip" data-user="${esc(u)}" ${u === rulesUser ? 'aria-pressed="true"' : 'aria-pressed="false"'}>${esc(u)}</button>`).join("");
   const days = week.map((rule, i) => editing === i ? `<li>${editorHtml(i)}</li>` : `
     <li><button type="button" class="day-row" data-edit="${i}"><span class="day-name">${DAYS[i]}</span><span class="day-summary">${esc(daySummary(rule))}</span></button></li>`).join("");
+  const others = users.filter((u) => u !== rulesUser);
+  const copyWeek = others.length ? `
+      <div class="editor-actions copy-week">
+        <label>Copy this week to <select id="copy-to"><option value="">choose…</option>${others.map((u) => `<option value="${esc(u)}">${esc(u)}</option>`).join("")}</select></label>
+        <button type="button" data-copy-week>Copy</button>
+      </div>
+      <p class="form-error" id="copy-error" role="alert" hidden></p>
+      <p class="footnote" id="copy-done" role="status" hidden></p>` : "";
   rulesEl.innerHTML = `
     <article class="card">
       <div class="chips" role="group" aria-label="Account">${picker}</div>
       <ul class="week-rules">${days}</ul>
+      ${copyWeek}
     </article>
     <article class="card">${blackoutsHtml(blackouts)}</article>`;
   if (message) showBlackoutError(message);
@@ -140,6 +149,27 @@ function showBlackoutError(message) {
   const el = document.getElementById("blackout-error");
   el.textContent = message;
   el.hidden = false;
+}
+
+// Replaces another account's whole week with this one's. Blackouts are left alone.
+async function copyWeekTo(target) {
+  const error = document.getElementById("copy-error");
+  const done = document.getElementById("copy-done");
+  error.hidden = done.hidden = true;
+  if (!target) {
+    error.textContent = "Choose who to copy to.";
+    error.hidden = false;
+    return;
+  }
+  if (!confirm(`Replace ${target}'s hours and budgets for every day with ${rulesUser}'s? ${target}'s blackouts stay as they are.`)) return;
+  try {
+    await api(`/api/rules/${encodeURIComponent(rulesUser)}/copy-to`, { method: "POST", body: { to: [target] } });
+    done.textContent = `Copied to ${target}.`;
+    done.hidden = false;
+  } catch (e) {
+    error.textContent = e.message || "Couldn't copy. Try again.";
+    error.hidden = false;
+  }
 }
 
 function showError(form, error) {
@@ -153,6 +183,7 @@ rulesEl.addEventListener("click", async (e) => {
   if (!t) return;
   const form = t.closest("form");
   if (t.dataset.retry !== undefined) return renderRules();
+  if (t.dataset.copyWeek !== undefined) return copyWeekTo(document.getElementById("copy-to").value);
   if (t.dataset.user) { rulesUser = t.dataset.user; editing = null; return renderRules(`[data-user="${CSS.escape(t.dataset.user)}"]`); }
   if (t.dataset.edit !== undefined) { editing = Number(t.dataset.edit); return renderRules("form[data-weekday] [name=restricted]"); }
   if (t.dataset.cancel !== undefined) { const day = editing; editing = null; return renderRules(`[data-edit="${day}"]`); }

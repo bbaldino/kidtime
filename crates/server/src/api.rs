@@ -127,6 +127,36 @@ pub async fn copy_rule(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[derive(Deserialize)]
+pub struct CopyWeek {
+    to: Vec<String>,
+}
+
+/// Replaces other accounts' whole weeks with this account's. Blackouts are not copied.
+pub async fn copy_week(
+    State(state): State<Arc<AppState>>,
+    Path(user): Path<String>,
+    Json(copy): Json<CopyWeek>,
+) -> Api<StatusCode> {
+    let mut db = state.db.lock().unwrap();
+    if !db.is_account(&user)? {
+        return Err(ApiError::NotFound);
+    }
+    if copy.to.is_empty() {
+        return Err(invalid("to", "choose at least one account to copy to"));
+    }
+    if copy.to.contains(&user) {
+        return Err(invalid("to", "an account can't be copied to itself"));
+    }
+    for target in &copy.to {
+        if !db.is_account(target)? {
+            return Err(invalid("to", "unknown account"));
+        }
+    }
+    db.copy_week(&user, &copy.to)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 pub async fn get_blackouts(
     State(state): State<Arc<AppState>>,
 ) -> Api<Json<Vec<crate::db::Blackout>>> {
@@ -348,6 +378,91 @@ mod tests {
         assert_eq!(body["days"][0], rule);
         assert_eq!(body["days"][4], rule);
         assert_eq!(body["days"][2]["restricted"], false);
+    }
+
+    /// Makes `name` a known account.
+    async fn report_for(app: &TestApp, name: &str) {
+        let at = chrono::Local::now().timestamp();
+        let body = json!({ "host": format!("host-{name}"), "agent_id": name, "interval_secs": 15, "samples": [{
+            "seq": 1, "at": at, "elapsed_secs": 15,
+            "users": [{ "user": name, "state": "active", "apps": [] }],
+        }]});
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/report")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer token")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = router(app.state.clone()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn a_week_can_be_copied_to_other_accounts() {
+        let app = app("copy-to");
+        for name in ["kid1", "kid2", "kid3"] {
+            report_for(&app, name).await;
+        }
+        let rule = json!({ "restricted": true, "stretches": [{ "start_min": 375, "end_min": 1260 }], "budgets": { "1": 60 } });
+        call(&app, "PUT", "/api/rules/kid1/0", Some(rule.clone())).await;
+        call(&app, "PUT", "/api/rules/kid2/3", Some(rule.clone())).await;
+
+        let copy = json!({ "to": ["kid2", "kid3"] });
+        assert_eq!(
+            call(&app, "POST", "/api/rules/kid1/copy-to", Some(copy))
+                .await
+                .0,
+            StatusCode::NO_CONTENT
+        );
+        let kid1 = call(&app, "GET", "/api/rules/kid1", None).await.1["days"].clone();
+        for name in ["kid2", "kid3"] {
+            assert_eq!(
+                call(&app, "GET", &format!("/api/rules/{name}"), None)
+                    .await
+                    .1["days"],
+                kid1,
+                "{name}"
+            );
+        }
+
+        // Nothing is written when any target is wrong
+        call(&app, "PUT", "/api/rules/kid3/6", Some(rule.clone())).await;
+        let bad = json!({ "to": ["kid2", "nobody"] });
+        let (status, body) = call(&app, "POST", "/api/rules/kid3/copy-to", Some(bad)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["field"], "to");
+        assert_eq!(
+            call(&app, "GET", "/api/rules/kid2", None).await.1["days"],
+            kid1
+        );
+
+        let to_self = json!({ "to": ["kid1"] });
+        assert_eq!(
+            call(&app, "POST", "/api/rules/kid1/copy-to", Some(to_self))
+                .await
+                .1["field"],
+            "to"
+        );
+        let empty = json!({ "to": [] });
+        assert_eq!(
+            call(&app, "POST", "/api/rules/kid1/copy-to", Some(empty))
+                .await
+                .1["field"],
+            "to"
+        );
+        let unknown_source = json!({ "to": ["kid2"] });
+        assert_eq!(
+            call(
+                &app,
+                "POST",
+                "/api/rules/nobody/copy-to",
+                Some(unknown_source)
+            )
+            .await
+            .0,
+            StatusCode::NOT_FOUND
+        );
     }
 
     #[tokio::test]
@@ -682,6 +797,7 @@ mod tests {
             ("GET", "/api/rules/kid1"),
             ("PUT", "/api/rules/kid1/0"),
             ("POST", "/api/rules/kid1/copy"),
+            ("POST", "/api/rules/kid1/copy-to"),
             ("GET", "/api/blackouts"),
             ("POST", "/api/blackouts"),
             ("DELETE", "/api/blackouts/1"),

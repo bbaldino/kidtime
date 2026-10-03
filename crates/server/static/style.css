@@ -242,3 +242,4 @@ main { max-width: 960px; margin: 0 auto; }
 [hidden] { display: none !important; }
 .ignored { margin-top: 16px; }
 .ignored summary { cursor: pointer; color: var(--text-secondary); font-weight: 600; padding: 6px 0; }
+.copy-week { margin-top: 12px; }
