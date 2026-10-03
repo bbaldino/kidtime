@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/bbaldino/kidtime/compare/v0.3.0...v0.4.0) (2026-10-03)
+
+
+### Features
+
+* copy a kid's week of rules to another kid ([140e288](https://github.com/bbaldino/kidtime/commit/140e288349f180cfd316e769e78118492c6605e2))
+
 ## [0.3.0](https://github.com/bbaldino/kidtime/compare/v0.2.1...v0.3.0) (2026-10-03)
 
 
