@@ -4,6 +4,7 @@
 
 const DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
 const GAMES = 1;
+const IGNORED = 2;
 const rulesEl = document.getElementById("tab-rules");
 const appsEl = document.getElementById("tab-apps");
 let rulesUser = null;
@@ -230,6 +231,8 @@ rulesEl.addEventListener("submit", async (e) => {
 let appList = []; // the catalogue as last fetched
 
 // `message` is shown in the card, for a change that didn't go through
+let ignoredOpen = false;
+
 async function renderApps(focusApp, message) {
   try {
     // The Today refresh normally supplies the categories; this tab can be opened before it has finished
@@ -239,9 +242,9 @@ async function renderApps(focusApp, message) {
     // After a failed change, fall through and draw the last list fetched: it has the stored values
     if (!message || !categories.length) { loadFailed(appsEl); return; }
   }
-  const options = (current) => [`<option value="" ${current === null ? "selected" : ""}>Uncategorised</option>`]
+  const options = (current) => [`<option value="" ${current === null ? "selected" : ""}>Uncategorised (counts as games)</option>`]
     .concat(categories.map((c) => `<option value="${c.id}" ${current === c.id ? "selected" : ""}>${esc(c.name)}</option>`)).join("");
-  const rows = appList.map((a) => `
+  const row = (a) => `
     <li class="app-row">
       <span class="app-name">${a.reviewed ? "" : '<span class="badge">New</span> '}${esc(a.name)}</span>
       <span class="app-seen">last used ${esc(new Date(a.last_seen * 1000).toLocaleDateString(undefined, { month: "short", day: "numeric" }))}</span>
@@ -249,16 +252,29 @@ async function renderApps(focusApp, message) {
         <select data-app="${esc(a.app_id)}" aria-label="Category for ${esc(a.name)}">${options(a.category_id)}</select>
         ${a.reviewed ? "" : `<button type="button" data-review="${esc(a.app_id)}" aria-label="${esc(a.name)} looks right">Looks right</button>`}
       </span>
-    </li>`).join("");
+    </li>`;
+  const shown = appList.filter((a) => a.category_id !== IGNORED);
+  const ignored = appList.filter((a) => a.category_id === IGNORED);
+  const rows = shown.map(row).join("");
+  // Keep the section open across redraws, and open it when the app being focused is in it
+  if (focusApp && ignored.some((a) => a.app_id === focusApp)) ignoredOpen = true;
+  const ignoredSection = ignored.length ? `
+      <details class="ignored" ${ignoredOpen ? "open" : ""}>
+        <summary>Ignored (${ignored.length})</summary>
+        <p class="footnote">Hidden from Today and never counted toward a budget. Pick another category to bring one back.</p>
+        <ul class="apps">${ignored.map(row).join("")}</ul>
+      </details>` : "";
   const anyNew = appList.some((a) => !a.reviewed);
   appsEl.innerHTML = `
     <article class="card">
-      <p class="footnote">Only apps in a category with a budget use that budget. Steam games and anything played in a stream are set to Games automatically; change any of them here.</p>
+      <p class="footnote">Games and uncategorised apps count toward the games budget, so a new game counts from its first minute. Steam games and anything played in a stream are set to Games automatically. Move apps you don't care about to Ignored.</p>
       <p class="footnote">At the desktop an app counts while it is open and the kid is active, even in the background. Games launched outside Steam at the desktop may not be detected.</p>
       ${anyNew ? '<div class="card-actions"><button type="button" data-review-all>Mark all as reviewed</button></div>' : ""}
       <p class="form-error" id="apps-error" role="alert" hidden></p>
-      <ul class="apps">${rows || '<li class="empty-note">No apps seen yet.</li>'}</ul>
+      <ul class="apps">${rows || `<li class="empty-note">${ignored.length ? "Every app is ignored." : "No apps seen yet."}</li>`}</ul>
+      ${ignoredSection}
     </article>`;
+  appsEl.querySelector("details.ignored")?.addEventListener("toggle", (e) => { ignoredOpen = e.target.open; });
   if (message) {
     const el = document.getElementById("apps-error");
     el.textContent = message;

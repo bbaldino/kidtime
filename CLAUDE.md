@@ -39,7 +39,8 @@ A Cargo workspace (edition 2024) with three crates:
     intervals across hosts**, so streaming from one machine to another doesn't count twice.
   - `agents(host, agent_id, last_seq)` drops samples the server has already recorded.
   - `account(user, last_seen)` lists the accounts that have reported, so the Rules tab knows who to show.
-  - `category(id, name)` holds app categories. `Games` (id 1) is created on first start.
+  - `category(id, name)` holds app categories. `Games` (id 1) and `Ignored` (id 2) are created on first start.
+    Ignored apps are hidden from the Today cards and count toward no budget; their time is still recorded.
   - `app(app_id, name, first_seen, last_seen, category_id, set_by_person, reviewed)` holds every app seen and its category.
   - `app_activity(user, host, app_id, start, end)` holds merged stretches per user, host and app: a counted
     sample extends the app's latest stretch when it starts where that one ends, and otherwise starts a new one.
@@ -244,6 +245,8 @@ Run `cargo test` (all pass) and `cargo clippy --all-targets` (clean). Tests cove
 - Daily totals are the union of intervals across hosts; per-host and per-app breakdowns stay as plain sums.
 - Window titles are only used to name apps in streaming sessions (mostly games). Think about privacy before
   recording titles on desktops (e.g. browser page titles).
+- Uncategorised apps count toward the games budget until someone sorts them (undercounting a game is worse
+  than overcounting a terminal); Ignored apps count toward nothing.
 - Budgets count one category of apps; category time is worked out from per-app stretches when asked, so
   recategorising applies to the whole day.
 - Tracking is per account. If kids use a parent's account, that time isn't attributed to them.

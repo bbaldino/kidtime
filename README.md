@@ -125,7 +125,8 @@ The dashboard has three tabs.
 - **Today** shows each kid's usage, what the rules say right now, and a log of what kidtime would have done.
   Nothing is enforced on the computers yet.
 - **Rules** sets, per kid and per weekday, the allowed hours and a games budget, plus one-off blackouts.
-- **Apps** lists every app seen and its category. Only apps in the Games category use the games budget.
+- **Apps** lists every app seen and its category. Games and uncategorised apps use the games budget; move apps
+  you don't care about to **Ignored** to hide them from Today and stop them counting.
 
 ## Who can see and change things
 

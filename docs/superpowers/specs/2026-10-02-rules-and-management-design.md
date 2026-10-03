@@ -26,7 +26,7 @@ would have locked or closed something; and nobody can read or change any of it w
 | Allowed hours | Several from–to stretches per weekday, or "no restriction". |
 | Blackout | A span of time when the computer isn't allowed. Recurring ones are the weekly schedule. One-off ones have a start and an end date-time, for one kid or all. |
 | Budget | Counts one category of apps, not all time. Only Games has a budget in this piece. The model allows a budget per category later. |
-| Categorisation | Automatic where obvious, with a screen to correct it. Uncategorised apps use no budget. |
+| Categorisation | Automatic where obvious, with a screen to correct it. Uncategorised apps count toward the games budget until someone sorts them; Ignored apps are hidden and count toward nothing. (Amended 2026-10-02; originally uncategorised used no budget.) |
 | Category time | Stored per app as time stretches; category time is worked out when asked, so recategorising applies to the whole day. |
 | Who may edit | Anyone with a login verified from the reverse proxy's signed token. Kidtime stores no passwords and no user list. |
 | Without a login | Only `/api/report` and `/healthz` answer. No kid view in this piece. |
@@ -52,8 +52,14 @@ local midnight to local midnight.
 
 ## Categories
 
-- A category has an id and a name. One is created on first start: Games. Creating more is out of scope,
-  but nothing in the model assumes there is only one.
+- A category has an id and a name. Two are created on first start: Games and Ignored. Creating more is out
+  of scope, but nothing in the model assumes a fixed set.
+- **Ignored** is for apps nobody cares about: they are left out of the Today cards (per-app bars and "running
+  now"), listed in a collapsed section of the Apps tab, and never count toward a budget. A budget can't be set
+  on Ignored. Their time is still recorded, so moving an app out of Ignored restores its history.
+- **Uncategorised apps count toward the games budget.** Missing a play session is worse than overcounting,
+  and a new game would otherwise play free until someone noticed it. Sorting an app into Ignored (or another
+  category) stops it counting. (Amended 2026-10-02.)
 - The server keeps a catalogue of every app id it has seen: latest name, first seen, last seen, category
   (or none), whether the category was set by a person, and whether a person has reviewed it.
 - Automatic rules, applied when an app is first seen and only while no person has set its category:

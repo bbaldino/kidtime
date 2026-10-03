@@ -92,6 +92,9 @@ pub async fn put_rule(
     if rule.budgets.keys().any(|id| !known.contains(id)) {
         return Err(invalid("budgets", "unknown category"));
     }
+    if rule.budgets.contains_key(&crate::db::IGNORED) {
+        return Err(invalid("budgets", "ignored apps can't have a budget"));
+    }
     db.set_day_rule(&user, weekday, &rule)?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -472,7 +475,56 @@ mod tests {
             "category_id"
         );
         let (_, categories) = call(&app, "GET", "/api/categories", None).await;
-        assert_eq!(categories, json!([{ "id": 1, "name": "Games" }]));
+        assert_eq!(
+            categories,
+            json!([{ "id": 1, "name": "Games" }, { "id": 2, "name": "Ignored" }])
+        );
+    }
+
+    #[tokio::test]
+    async fn ignored_cannot_have_a_budget() {
+        let app = app("ignored-budget");
+        report(&app, "steam:1").await;
+        let rule = json!({ "restricted": false, "budgets": { "2": 30 } });
+        let (status, body) = call(&app, "PUT", "/api/rules/kid1/0", Some(rule)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["field"], "budgets");
+    }
+
+    #[tokio::test]
+    async fn status_leaves_ignored_apps_out() {
+        let app = app("status-ignored");
+        let at = chrono::Local::now().timestamp();
+        let body = json!({ "host": "host-a", "agent_id": "a", "interval_secs": 15, "samples": [{
+            "seq": 1, "at": at, "elapsed_secs": 15,
+            "users": [{ "user": "kid1", "state": "active", "apps": [
+                { "id": "steam:1", "name": "Minecraft" },
+                { "id": "org.example.Terminal", "name": "Terminal" },
+            ] }],
+        }]});
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/report")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer token")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        router(app.state.clone()).oneshot(request).await.unwrap();
+        let uri = "/api/apps/org.example.Terminal";
+        assert_eq!(
+            call(&app, "PUT", uri, Some(json!({ "category_id": 2 })))
+                .await
+                .0,
+            StatusCode::NO_CONTENT
+        );
+
+        let (_, status) = call(&app, "GET", "/api/status", None).await;
+        let user = &status["users"][0];
+        assert_eq!(user["apps_today"].as_array().unwrap().len(), 1);
+        assert_eq!(user["apps_today"][0]["name"], "Minecraft");
+        assert_eq!(user["sessions"][0]["apps"], json!(["Minecraft"]));
+        // The day's total is time at the computer, whatever was running
+        assert_eq!(user["today_secs"], 15);
     }
 
     #[tokio::test]

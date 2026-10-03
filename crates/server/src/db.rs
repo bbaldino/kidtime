@@ -19,6 +19,9 @@ use crate::rules::{self, BlackoutSpan, CategoryId, Computer, DayRule, Decision, 
 
 /// The one category created at first start.
 pub const GAMES: CategoryId = 1;
+/// Apps a person has marked as not worth tracking: hidden from the dashboard and never budgeted.
+/// Their time is still recorded, so moving one back restores its history.
+pub const IGNORED: CategoryId = 2;
 
 #[derive(Debug, Serialize)]
 pub struct AppEntry {
@@ -188,7 +191,7 @@ impl Db {
                  id   INTEGER PRIMARY KEY,
                  name TEXT NOT NULL
              );
-             INSERT OR IGNORE INTO category (id, name) VALUES (1, 'Games');
+             INSERT OR IGNORE INTO category (id, name) VALUES (1, 'Games'), (2, 'Ignored');
              CREATE TABLE IF NOT EXISTS app (
                  app_id        TEXT PRIMARY KEY,
                  name          TEXT NOT NULL,
@@ -413,14 +416,16 @@ impl Db {
         Ok(rows)
     }
 
-    /// Seconds per app for the user on `day`, across hosts, largest first.
+    /// Seconds per app for the user on `day`, across hosts, largest first. Ignored apps are left out.
     pub fn app_totals(&self, user: &str, day: NaiveDate) -> Result<Vec<AppUsage>> {
         let mut stmt = self.conn.prepare(
-            "SELECT MAX(app_name), SUM(secs) AS total FROM usage WHERE user = ?1 AND app_id != ?2 AND day = ?3
-             GROUP BY app_id ORDER BY total DESC",
+            "SELECT MAX(u.app_name), SUM(u.secs) AS total FROM usage u LEFT JOIN app ON app.app_id = u.app_id
+             WHERE u.user = ?1 AND u.app_id != ?2 AND u.day = ?3
+               AND (app.category_id IS NULL OR app.category_id != ?4)
+             GROUP BY u.app_id ORDER BY total DESC",
         )?;
         let rows = stmt
-            .query_map(params![user, TOTAL, day.to_string()], |r| {
+            .query_map(params![user, TOTAL, day.to_string(), IGNORED], |r| {
                 Ok(AppUsage {
                     name: r.get(0)?,
                     secs: r.get(1)?,
@@ -428,6 +433,17 @@ impl Db {
             })?
             .collect::<Result<_, _>>()?;
         Ok(rows)
+    }
+
+    /// Ids of apps in the Ignored category.
+    pub fn ignored_app_ids(&self) -> Result<std::collections::HashSet<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT app_id FROM app WHERE category_id = ?1")?;
+        let ids = stmt
+            .query_map([IGNORED], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        Ok(ids)
     }
 
     /// The catalogue: apps nobody has looked at first, then the most recently seen.
@@ -485,15 +501,21 @@ impl Db {
 
     /// Seconds on `day` during which the user had an app of each category in use, on any host.
     /// Categories with no time are left out.
+    ///
+    /// An app nobody has categorised counts as a game: missing a play session is worse than
+    /// overcounting, and sorting it into Ignored (or another category) stops it counting. Ignored
+    /// apps count toward nothing.
     pub fn category_secs(&self, user: &str, day: NaiveDate) -> Result<BTreeMap<CategoryId, i64>> {
         let (day_start, day_end) = (midnight(day), midnight(day + Days::new(1)));
         let mut stmt = self.conn.prepare(
-            "SELECT app.category_id, a.start, a.end FROM app_activity a JOIN app ON app.app_id = a.app_id
-             WHERE a.user = ?1 AND a.end > ?2 AND a.start < ?3 AND app.category_id IS NOT NULL
-             ORDER BY app.category_id, a.start",
+            "SELECT COALESCE(app.category_id, ?4) AS category, a.start, a.end
+             FROM app_activity a JOIN app ON app.app_id = a.app_id
+             WHERE a.user = ?1 AND a.end > ?2 AND a.start < ?3
+               AND (app.category_id IS NULL OR app.category_id != ?5)
+             ORDER BY category, a.start",
         )?;
         let mut by_category: BTreeMap<CategoryId, Vec<(i64, i64)>> = BTreeMap::new();
-        let rows = stmt.query_map(params![user, day_start, day_end], |r| {
+        let rows = stmt.query_map(params![user, day_start, day_end, GAMES, IGNORED], |r| {
             Ok((
                 r.get::<_, CategoryId>(0)?,
                 r.get::<_, i64>(1)?,
@@ -1087,10 +1109,90 @@ mod tests {
         ))
         .unwrap();
         let today = Local::now().date_naive();
+        db.set_app_category("org.example.Launcher", Some(IGNORED))
+            .unwrap();
         assert!(db.category_secs("kid1", today).unwrap().is_empty());
         db.set_app_category("org.example.Launcher", Some(GAMES))
             .unwrap();
         assert_eq!(db.category_secs("kid1", today).unwrap()[&GAMES], 15);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn uncategorised_time_counts_toward_games_and_ignored_time_does_not() {
+        let (mut db, path) = temp_db("uncategorised");
+        let t0 = start_of_test();
+        let today = Local::now().date_naive();
+        // 15s with an uncategorised app only
+        db.record(&sample_report(
+            "host-a",
+            1,
+            t0 + 15,
+            UserState::Active,
+            &[("org.example.New", "New")],
+        ))
+        .unwrap();
+        assert_eq!(db.category_secs("kid1", today).unwrap()[&GAMES], 15);
+        // Ignoring it removes that time from Games, and Ignored itself is never reported
+        db.set_app_category("org.example.New", Some(IGNORED))
+            .unwrap();
+        assert!(db.category_secs("kid1", today).unwrap().is_empty());
+        // A Games app and an uncategorised one at the same time count once
+        db.record(&sample_report(
+            "host-a",
+            2,
+            t0 + 300,
+            UserState::Active,
+            &[("steam:1", "Minecraft"), ("org.example.Other", "Other")],
+        ))
+        .unwrap();
+        assert_eq!(db.category_secs("kid1", today).unwrap()[&GAMES], 15);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn ignored_apps_are_still_recorded_and_hidden_from_app_totals() {
+        let (mut db, path) = temp_db("ignored");
+        let t0 = start_of_test();
+        let today = Local::now().date_naive();
+        db.record(&sample_report(
+            "host-a",
+            1,
+            t0 + 15,
+            UserState::Active,
+            &[("steam:1", "Minecraft")],
+        ))
+        .unwrap();
+        db.set_app_category("steam:1", Some(IGNORED)).unwrap();
+        db.record(&sample_report(
+            "host-a",
+            2,
+            t0 + 30,
+            UserState::Active,
+            &[("steam:1", "Minecraft"), ("org.example.Editor", "Editor")],
+        ))
+        .unwrap();
+        let names: Vec<String> = db
+            .app_totals("kid1", today)
+            .unwrap()
+            .into_iter()
+            .map(|a| a.name)
+            .collect();
+        assert_eq!(names, ["Editor"]);
+        assert_eq!(
+            db.ignored_app_ids().unwrap(),
+            std::collections::HashSet::from(["steam:1".to_string()])
+        );
+        // Unignoring brings the whole day back: both samples were recorded
+        db.set_app_category("steam:1", Some(GAMES)).unwrap();
+        let minecraft = db
+            .app_totals("kid1", today)
+            .unwrap()
+            .into_iter()
+            .find(|a| a.name == "Minecraft")
+            .unwrap();
+        assert_eq!(minecraft.secs, 30);
+        assert_eq!(db.category_secs("kid1", today).unwrap()[&GAMES], 30);
         std::fs::remove_file(&path).unwrap();
     }
 
@@ -1447,11 +1549,11 @@ mod tests {
     fn categories_used_up_one_after_the_other_each_log_closed() {
         let (mut db, path) = temp_db("events-two");
         db.conn
-            .execute("INSERT INTO category (id, name) VALUES (2, 'Videos')", [])
+            .execute("INSERT INTO category (id, name) VALUES (3, 'Videos')", [])
             .unwrap();
         db.log_decision("kid1", 100, &decision_of(Computer::Allowed, &[GAMES]))
             .unwrap();
-        db.log_decision("kid1", 110, &decision_of(Computer::Allowed, &[GAMES, 2]))
+        db.log_decision("kid1", 110, &decision_of(Computer::Allowed, &[GAMES, 3]))
             .unwrap();
         assert_eq!(
             kinds(&db),

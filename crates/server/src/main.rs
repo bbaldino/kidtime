@@ -329,7 +329,12 @@ async fn status(State(state): State<Arc<AppState>>) -> Result<Json<Status>, Stat
     let first_day = today - Days::new(HISTORY_DAYS - 1);
     let now = now();
 
-    // Live sessions per user, ignoring hosts that have gone quiet
+    let ignored = state.db.lock().unwrap().ignored_app_ids().map_err(|e| {
+        tracing::error!("status query: {e:#}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    // Live sessions per user, ignoring hosts that have gone quiet, and leaving out ignored apps
     let mut sessions: HashMap<String, Vec<HostSession>> = HashMap::new();
     for (host, live) in state.live.lock().unwrap().iter() {
         let stale = now - live.received_at > i64::from(live.interval_secs) * 3;
@@ -337,7 +342,8 @@ async fn status(State(state): State<Arc<AppState>>) -> Result<Json<Status>, Stat
             let (state, apps) = if stale {
                 (UserState::Offline, Vec::new())
             } else {
-                (u.state, u.apps.iter().map(|a| a.name.clone()).collect())
+                let shown = u.apps.iter().filter(|a| !ignored.contains(&a.id));
+                (u.state, shown.map(|a| a.name.clone()).collect())
             };
             sessions
                 .entry(u.user.clone())
