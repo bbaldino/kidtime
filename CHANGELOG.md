@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/bbaldino/kidtime/compare/v0.2.1...v0.3.0) (2026-10-03)
+
+
+### Features
+
+* add an Ignored category and count uncategorised apps as games ([953edcd](https://github.com/bbaldino/kidtime/commit/953edcd34b9c2f9e123fc88bd365ec6c0c6000dc))
+
 ## [0.2.1](https://github.com/bbaldino/kidtime/compare/v0.2.0...v0.2.1) (2026-10-02)
 
 
