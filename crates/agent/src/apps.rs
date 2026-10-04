@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use protocol::App;
 
 use crate::enforce::RunningApp;
+use crate::files::{SHORTCUTS, SMALL, read_capped, read_capped_string};
 
 /// Launcher prefixes systemd scope names may carry before the app id.
 const LAUNCHERS: &[&str] = &["gnome", "flatpak", "kde", "KDE", "xdg"];
@@ -123,7 +124,9 @@ impl Scanner {
             .or_insert_with(|| {
                 desktop_dirs(home)
                     .iter()
-                    .find_map(|dir| fs::read_to_string(dir.join(format!("{id}.desktop"))).ok())
+                    .find_map(|dir| {
+                        read_capped_string(&dir.join(format!("{id}.desktop")), SMALL).ok()
+                    })
                     .and_then(|contents| parse_desktop_entry(&contents))
             })
             .clone()
@@ -138,7 +141,7 @@ impl Scanner {
                     .iter()
                     .find_map(|lib| {
                         let manifest = lib.join(format!("steamapps/appmanifest_{appid}.acf"));
-                        vdf_values(&fs::read_to_string(manifest).ok()?, "name")
+                        vdf_values(&read_capped_string(&manifest, SMALL).ok()?, "name")
                             .into_iter()
                             .next()
                     })
@@ -149,8 +152,11 @@ impl Scanner {
                                 .ok()?
                                 .flatten()
                                 .find_map(|account| {
-                                    let vdf = fs::read(account.path().join("config/shortcuts.vdf"))
-                                        .ok()?;
+                                    let vdf = read_capped(
+                                        &account.path().join("config/shortcuts.vdf"),
+                                        SHORTCUTS,
+                                    )
+                                    .ok()?;
                                     shortcut_name(&vdf, appid)
                                 })
                         })
@@ -343,7 +349,7 @@ fn steam_libraries(home: &Path) -> Vec<PathBuf> {
     let roots = [home.join(".local/share/Steam"), home.join(".steam/steam")];
     let mut libs: Vec<PathBuf> = roots.to_vec();
     for root in &roots {
-        if let Ok(vdf) = fs::read_to_string(root.join("steamapps/libraryfolders.vdf")) {
+        if let Ok(vdf) = read_capped_string(&root.join("steamapps/libraryfolders.vdf"), SMALL) {
             libs.extend(vdf_values(&vdf, "path").into_iter().map(PathBuf::from));
         }
     }

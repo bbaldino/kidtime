@@ -4,6 +4,7 @@
 mod actions;
 mod apps;
 mod enforce;
+mod files;
 mod logind;
 mod sunshine;
 mod sway;
@@ -13,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use chrono::{Local, NaiveDate};
+use chrono::{Local, NaiveDate, NaiveDateTime};
 use protocol::{App, Report, ReportResponse, Sample, UserSample, UserState};
 use serde::Deserialize;
 
@@ -23,6 +24,8 @@ const MAX_BATCH: usize = 500;
 /// Drop cached app names now and then so newly installed apps and games get picked up.
 const CACHE_CLEAR_TICKS: u64 = 240;
 const ENFORCE_EVERY: Duration = Duration::from_secs(5);
+/// A blocked kid can unlock their own session from inside it: re-lock this often.
+const RELOCK_EVERY: Duration = Duration::from_secs(1);
 
 #[derive(Deserialize)]
 struct Config {
@@ -42,6 +45,10 @@ struct Config {
     /// What enforcement did to this PC (disabled logins, cut streams) and the last rules, across restarts.
     #[serde(default = "default_state_file")]
     state_file: PathBuf,
+    /// Sunshine base port per account, for cutting streams. Without it, the port is read from the kid's
+    /// sunshine.conf (which the kid can edit), then Sunshine's default.
+    #[serde(default)]
+    sunshine_ports: HashMap<String, u16>,
 }
 
 fn default_interval() -> u32 {
@@ -77,11 +84,11 @@ async fn main() -> Result<()> {
         }
     }
 
-    let config: Config = toml::from_str(
-        &std::fs::read_to_string(&config_path)
-            .with_context(|| format!("reading {}", config_path.display()))?,
-    )
-    .with_context(|| format!("parsing {}", config_path.display()))?;
+    let config = read_config(&config_path);
+    if release_all {
+        return release_everything(release_setup(config));
+    }
+    let config = config?;
     let host = match &config.host {
         Some(h) => h.clone(),
         None => std::fs::read_to_string("/proc/sys/kernel/hostname")?
@@ -97,29 +104,6 @@ async fn main() -> Result<()> {
         .iter()
         .map(|u| (u.name.clone(), (u.uid, u.home.clone())))
         .collect();
-
-    if release_all {
-        let mut actions =
-            actions::SystemActions::new(users_map, config.streaming_sway_socket.clone());
-        let mut enforcer = enforce::Enforcer::new(load_state(&config.state_file));
-        let released = enforcer.release_all(&mut actions);
-        save_state(&config.state_file, &enforcer.persisted)?;
-        let state = &enforcer.persisted;
-        if !state.login_disabled.is_empty() || !state.streams_blocked.is_empty() {
-            let list = |set: &std::collections::BTreeSet<String>| {
-                set.iter().cloned().collect::<Vec<_>>().join(", ")
-            };
-            bail!(
-                "could not undo everything: login still disabled for [{}], stream still blocked for [{}]",
-                list(&state.login_disabled),
-                list(&state.streams_blocked)
-            );
-        }
-        if !released {
-            bail!("could not clear the login screen banner");
-        }
-        return Ok(());
-    }
 
     let logind = logind::Logind::connect()
         .await
@@ -152,7 +136,12 @@ async fn main() -> Result<()> {
     );
 
     let mut enforcer = enforce::Enforcer::new(load_state(&config.state_file));
-    let mut actions = actions::SystemActions::new(users_map, config.streaming_sway_socket.clone());
+    let mut actions = actions::SystemActions::new(
+        users_map,
+        config.streaming_sway_socket.clone(),
+        config.state_file.clone(),
+        config.sunshine_ports.clone(),
+    );
 
     let mut pending: VecDeque<Sample> = VecDeque::new();
     let mut ticker = tokio::time::interval(interval);
@@ -161,6 +150,8 @@ async fn main() -> Result<()> {
     // The first enforcement tick is immediate: a block from before a restart resumes at once
     let mut enforce_ticker = tokio::time::interval(ENFORCE_EVERY);
     enforce_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut relock_ticker = tokio::time::interval(RELOCK_EVERY);
+    relock_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // Instant uses CLOCK_MONOTONIC, which stops while the machine is suspended
     let mut last_tick = Instant::now();
     let mut seq = 0u64;
@@ -170,6 +161,7 @@ async fn main() -> Result<()> {
 
     // One task: each arm runs to completion before the next tick is picked, and a sample tick
     // sends at most one batch, so enforcement waits at most one request (the client timeout).
+    // Every command an arm runs is killed after 5 seconds, so no arm can block the others for long.
     loop {
         tokio::select! {
             _ = ticker.tick() => {
@@ -230,10 +222,8 @@ async fn main() -> Result<()> {
                         });
                         // The response resets the local count, so it only applies once the server has every
                         // sample counted here; with a backlog, the reply to the last batch does
-                        if pending.is_empty()
-                            && let Some(response) = parse_response(&body)
-                        {
-                            enforcer.apply_response(&response, Local::now().naive_local());
+                        if pending.is_empty() {
+                            handle_reply(&mut enforcer, &body, Local::now().naive_local());
                             save_if_dirty(&mut enforcer, &config.state_file);
                         }
                     }
@@ -247,6 +237,18 @@ async fn main() -> Result<()> {
                 enforcer.tick(Local::now().naive_local(), &observations, &mut actions);
                 save_if_dirty(&mut enforcer, &config.state_file);
             }
+            _ = relock_ticker.tick() => {
+                let blocked = enforcer.blocked_users();
+                if !blocked.is_empty() {
+                    let now = Local::now().naive_local();
+                    for user in users.iter().filter(|u| blocked.contains(&u.name)) {
+                        match logind.graphical_sessions(user.uid).await {
+                            Ok(sessions) => enforcer.relock(now, &user.name, &sessions, &mut actions),
+                            Err(e) => tracing::debug!("logind sessions for {}: {e}", user.name),
+                        }
+                    }
+                }
+            }
             _ = tokio::signal::ctrl_c() => break,
             _ = sigterm.recv() => break,
         }
@@ -256,21 +258,118 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+fn read_config(path: &Path) -> Result<Config> {
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+}
+
+/// What `--release-all` works from.
+struct ReleaseSetup {
+    users: HashMap<String, (u32, PathBuf)>,
+    streaming_sway_socket: Option<String>,
+    state_file: PathBuf,
+    sunshine_ports: HashMap<String, u16>,
+}
+
+/// `--release-all` must work even when the config is broken or an account is gone: undoing needs only the
+/// account names in the state file (`usermod -U`, the nftables rules) and nothing at all for the banner.
+fn release_setup(config: Result<Config>) -> ReleaseSetup {
+    match config {
+        Ok(c) => ReleaseSetup {
+            users: c
+                .users
+                .iter()
+                .filter_map(|name| lookup_user(name).map_err(|e| tracing::warn!("{e:#}")).ok())
+                .map(|u| (u.name, (u.uid, u.home)))
+                .collect(),
+            streaming_sway_socket: c.streaming_sway_socket,
+            state_file: c.state_file,
+            sunshine_ports: c.sunshine_ports,
+        },
+        Err(e) => {
+            let state_file = default_state_file();
+            tracing::warn!(
+                "{e:#}; releasing from the state file alone ({})",
+                state_file.display()
+            );
+            ReleaseSetup {
+                users: HashMap::new(),
+                streaming_sway_socket: None,
+                state_file,
+                sunshine_ports: HashMap::new(),
+            }
+        }
+    }
+}
+
+/// Undoes everything recorded in the state file; an error if anything remains.
+fn release_everything(setup: ReleaseSetup) -> Result<()> {
+    let mut actions = actions::SystemActions::new(
+        setup.users,
+        setup.streaming_sway_socket,
+        setup.state_file.clone(),
+        setup.sunshine_ports,
+    );
+    let mut enforcer = enforce::Enforcer::new(load_state(&setup.state_file));
+    let released = enforcer.release_all(&mut actions);
+    save_state(&setup.state_file, &enforcer.persisted)?;
+    let state = &enforcer.persisted;
+    if !state.login_disabled.is_empty() || !state.streams_blocked.is_empty() {
+        let list = |set: &std::collections::BTreeSet<String>| {
+            set.iter().cloned().collect::<Vec<_>>().join(", ")
+        };
+        bail!(
+            "could not undo everything: login still disabled for [{}], stream still blocked for [{}]",
+            list(&state.login_disabled),
+            list(&state.streams_blocked)
+        );
+    }
+    if !released {
+        bail!("could not clear the login screen banner");
+    }
+    Ok(())
+}
+
 /// The date the enforcer decides with: local time corrected by the server's clock, if ours is off.
 fn enforcer_today(enforcer: &enforce::Enforcer) -> NaiveDate {
     (Local::now().naive_local() + chrono::Duration::seconds(enforcer.persisted.clock_offset_secs))
         .date()
 }
 
-/// The server's rules, or None for a reply without them (an older server answers with an empty body).
-fn parse_response(body: &[u8]) -> Option<ReportResponse> {
+/// What a successful (2xx) report response says.
+#[derive(Debug)]
+enum Reply {
+    /// An empty body: an old server, which has no rules (for instance after a rollback).
+    NoRules,
+    Rules(ReportResponse),
+    /// A body that doesn't parse: something is wrong, so keep enforcing what we have.
+    Unreadable(String),
+}
+
+fn parse_reply(body: &[u8]) -> Reply {
     if body.iter().all(u8::is_ascii_whitespace) {
-        tracing::debug!("the server sent no rules");
-        return None;
+        return Reply::NoRules;
     }
-    serde_json::from_slice(body)
-        .map_err(|e| tracing::debug!("ignoring a report response without rules: {e}"))
-        .ok()
+    match serde_json::from_slice(body) {
+        Ok(response) => Reply::Rules(response),
+        Err(e) => Reply::Unreadable(e.to_string()),
+    }
+}
+
+/// Applies a successful report response: no rules drops every snapshot (so the next tick releases
+/// everything); rules replace the snapshots; an unreadable body changes nothing.
+fn handle_reply(enforcer: &mut enforce::Enforcer, body: &[u8], local_now: NaiveDateTime) {
+    match parse_reply(body) {
+        Reply::NoRules => {
+            tracing::debug!("the server sent no rules");
+            enforcer.clear_snapshots();
+        }
+        Reply::Rules(response) => enforcer.apply_response(&response, local_now),
+        Reply::Unreadable(e) => {
+            tracing::warn!("ignoring a report response that doesn't parse: {e}")
+        }
+    }
 }
 
 /// What enforcement needs to see of each tracked account right now.
@@ -549,12 +648,95 @@ mod tests {
     }
 
     #[test]
-    fn an_old_server_reply_is_no_snapshot() {
-        assert!(parse_response(b"").is_none());
-        assert!(parse_response(b"ok").is_none());
-        assert!(parse_response(b"{\"something\":1}").is_none());
+    fn release_all_works_from_the_state_file_when_the_config_is_broken() {
+        let setup = release_setup(Err(anyhow::anyhow!("parsing /etc/kidtime/agent.toml")));
+        assert_eq!(setup.state_file, default_state_file());
+        assert!(setup.users.is_empty());
+        // An account that no longer exists doesn't stop the others being released
+        let config: Config = toml::from_str(
+            "server_url = \"http://x\"\ntoken = \"t\"\nusers = [\"no-such-kid-here\"]\nstate_file = \"/tmp/s.json\"\n",
+        )
+        .unwrap();
+        let setup = release_setup(Ok(config));
+        assert_eq!(setup.state_file, PathBuf::from("/tmp/s.json"));
+        assert!(setup.users.is_empty());
+    }
+
+    #[test]
+    fn sunshine_ports_are_read_from_the_config() {
+        let config: Config = toml::from_str(
+            "server_url = \"http://x\"\ntoken = \"t\"\nusers = [\"kid1\"]\n[sunshine_ports]\nkid1 = 48189\n",
+        )
+        .unwrap();
+        assert_eq!(config.sunshine_ports.get("kid1"), Some(&48189));
+    }
+
+    #[test]
+    fn replies_are_classified() {
+        assert!(matches!(parse_reply(b""), Reply::NoRules));
+        assert!(matches!(parse_reply(b" \n"), Reply::NoRules));
+        assert!(matches!(parse_reply(b"ok"), Reply::Unreadable(_)));
+        assert!(matches!(
+            parse_reply(b"{\"something\":1}"),
+            Reply::Unreadable(_)
+        ));
         let json = r#"{"server_time":"2026-10-05T12:00:00","accounts":[]}"#;
-        let response = parse_response(json.as_bytes()).unwrap();
-        assert!(response.accounts.is_empty());
+        assert!(matches!(parse_reply(json.as_bytes()), Reply::Rules(r) if r.accounts.is_empty()));
+    }
+
+    fn enforcer_with(users: &[&str]) -> (enforce::Enforcer, NaiveDateTime) {
+        let now = NaiveDate::from_ymd_opt(2026, 10, 5)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap();
+        let mut e = enforce::Enforcer::new(enforce::Persisted::default());
+        handle_reply(&mut e, reply_json(users, now).as_bytes(), now);
+        assert_eq!(e.persisted.snapshots.len(), users.len());
+        e.take_dirty();
+        (e, now)
+    }
+
+    fn reply_json(users: &[&str], now: NaiveDateTime) -> String {
+        let accounts: Vec<protocol::AccountSnapshot> = users
+            .iter()
+            .map(|u| protocol::AccountSnapshot {
+                user: u.to_string(),
+                enforce: true,
+                week: vec![Default::default(); 7],
+                blackouts: vec![],
+                used_secs: Default::default(),
+                games: vec![],
+                ignored: vec![],
+                for_day: now.date(),
+            })
+            .collect();
+        serde_json::to_string(&ReportResponse {
+            server_time: now,
+            accounts,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn an_empty_reply_drops_every_snapshot() {
+        let (mut e, now) = enforcer_with(&["kid1", "kid2"]);
+        handle_reply(&mut e, b"", now);
+        assert!(e.persisted.snapshots.is_empty());
+        assert!(e.take_dirty());
+    }
+
+    #[test]
+    fn a_reply_with_rules_replaces_them_and_drops_omitted_accounts() {
+        let (mut e, now) = enforcer_with(&["kid1", "kid2"]);
+        handle_reply(&mut e, reply_json(&["kid2"], now).as_bytes(), now);
+        assert_eq!(e.persisted.snapshots.keys().collect::<Vec<_>>(), ["kid2"]);
+    }
+
+    #[test]
+    fn an_unreadable_reply_keeps_everything() {
+        let (mut e, now) = enforcer_with(&["kid1", "kid2"]);
+        handle_reply(&mut e, b"<html>bad gateway</html>", now);
+        assert_eq!(e.persisted.snapshots.len(), 2);
+        assert!(!e.take_dirty());
     }
 }

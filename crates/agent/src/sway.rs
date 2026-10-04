@@ -7,13 +7,17 @@
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use protocol::App;
 use serde_json::Value;
 
 const MAGIC: &[u8] = b"i3-ipc";
 const GET_TREE: u32 = 4;
+/// The whole exchange with Sway, however its replies are paced.
+const DEADLINE: Duration = Duration::from_secs(2);
+/// The largest tree accepted.
+const MAX_REPLY: usize = 16 << 20;
 
 pub struct Window {
     /// Wayland app_id, or the X11 class for Xwayland windows.
@@ -26,7 +30,7 @@ pub struct Window {
 
 /// The focused window, if Sway is reachable and a titled window has focus.
 pub fn focused_window(socket: &Path) -> Option<Window> {
-    let tree = get_tree(socket)
+    let tree = get_tree(socket, DEADLINE)
         .map_err(|e| tracing::debug!("sway {}: {e}", socket.display()))
         .ok()?;
     find_focused(&tree)
@@ -57,25 +61,56 @@ pub fn app_for(window: &Window, steam_name: impl FnOnce(u32) -> String) -> App {
     }
 }
 
-fn get_tree(socket: &Path) -> std::io::Result<Value> {
+fn get_tree(socket: &Path, deadline: Duration) -> std::io::Result<Value> {
+    let end = Instant::now() + deadline;
     let mut stream = UnixStream::connect(socket)?;
-    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
-
     let mut request = MAGIC.to_vec();
     request.extend_from_slice(&0u32.to_le_bytes());
     request.extend_from_slice(&GET_TREE.to_le_bytes());
+    stream.set_write_timeout(Some(remaining(end)?))?;
     stream.write_all(&request)?;
 
     let mut header = [0u8; 14];
-    stream.read_exact(&mut header)?;
+    read_by(&mut stream, &mut header, end)?;
     if &header[..6] != MAGIC {
         return Err(std::io::Error::other("not a sway IPC socket"));
     }
     let len = u32::from_le_bytes(header[6..10].try_into().expect("4 bytes")) as usize;
+    if len > MAX_REPLY {
+        return Err(std::io::Error::other(format!(
+            "reply too large ({len} bytes)"
+        )));
+    }
     let mut body = vec![0u8; len];
-    stream.read_exact(&mut body)?;
+    read_by(&mut stream, &mut body, end)?;
     Ok(serde_json::from_slice(&body)?)
+}
+
+/// Time left before `end`, or a timeout error.
+fn remaining(end: Instant) -> std::io::Result<Duration> {
+    let left = end.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "sway took too long to answer",
+        ));
+    }
+    Ok(left)
+}
+
+/// Fills `buf`, failing once `end` passes however the bytes are paced.
+fn read_by(stream: &mut UnixStream, buf: &mut [u8], end: Instant) -> std::io::Result<()> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        stream.set_read_timeout(Some(remaining(end)?))?;
+        match stream.read(&mut buf[filled..]) {
+            Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 fn find_focused(node: &Value) -> Option<Window> {
@@ -105,6 +140,82 @@ fn find_focused(node: &Value) -> Option<Window> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::os::unix::net::UnixListener;
+
+    /// A fake Sway that answers any request with `reply`, `chunk` bytes at a time, `pause` apart.
+    fn fake_sway(name: &str, reply: Vec<u8>, chunk: usize, pause: Duration) -> std::path::PathBuf {
+        let dir = std::path::PathBuf::from("/tmp/claude-1000/kidtime-sdd");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{name}-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut request = [0u8; 14];
+            let _ = conn.read_exact(&mut request);
+            for part in reply.chunks(chunk) {
+                if conn.write_all(part).is_err() {
+                    return;
+                }
+                std::thread::sleep(pause);
+            }
+            std::thread::sleep(Duration::from_secs(5));
+        });
+        path
+    }
+
+    fn message(body: &[u8], claimed_len: u32) -> Vec<u8> {
+        let mut m = MAGIC.to_vec();
+        m.extend_from_slice(&claimed_len.to_le_bytes());
+        m.extend_from_slice(&GET_TREE.to_le_bytes());
+        m.extend_from_slice(body);
+        m
+    }
+
+    #[test]
+    fn a_tree_is_read() {
+        let body = br#"{"nodes":[]}"#;
+        let socket = fake_sway(
+            "ok",
+            message(body, body.len() as u32),
+            1 << 20,
+            Duration::ZERO,
+        );
+        let tree = get_tree(&socket, Duration::from_millis(500)).unwrap();
+        assert!(tree["nodes"].is_array());
+        std::fs::remove_file(&socket).unwrap();
+    }
+
+    #[test]
+    fn a_slow_reply_fails_at_the_overall_deadline() {
+        // Each byte comes well within a per-read timeout, but the whole reply would take seconds
+        let body = vec![b' '; 64];
+        let socket = fake_sway("slow", message(&body, 64), 1, Duration::from_millis(50));
+        let start = Instant::now();
+        assert!(get_tree(&socket, Duration::from_millis(500)).is_err());
+        assert!(
+            start.elapsed() < Duration::from_millis(1500),
+            "{:?}",
+            start.elapsed()
+        );
+        std::fs::remove_file(&socket).unwrap();
+    }
+
+    #[test]
+    fn an_oversized_reply_is_refused() {
+        let socket = fake_sway(
+            "big",
+            message(b"", (MAX_REPLY + 1) as u32),
+            1 << 20,
+            Duration::ZERO,
+        );
+        let start = Instant::now();
+        let err = get_tree(&socket, Duration::from_millis(500)).unwrap_err();
+        assert!(err.to_string().contains("too large"), "{err}");
+        assert!(start.elapsed() < Duration::from_millis(400));
+        std::fs::remove_file(&socket).unwrap();
+    }
 
     #[test]
     fn finds_focused_window() {

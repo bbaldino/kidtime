@@ -6,6 +6,7 @@ version.workspace = true
 [dependencies]
 anyhow = "1.0.104"
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std", "serde"] }
+libc = "0.2.190"
 protocol = { version = "0.1.0", path = "../protocol" }
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls"] }
 serde = { version = "1.0.229", features = ["derive"] }

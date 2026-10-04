@@ -44,10 +44,19 @@ pub struct Observation {
     pub streaming_host: bool,
 }
 
+/// An account's password login.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Login {
+    Enabled,
+    Disabled,
+    /// No password at all: disabling would make the account impossible to unlock again, so it never is.
+    NoPassword,
+}
+
 pub trait Actions {
     fn lock_session(&mut self, session_id: &str) -> anyhow::Result<()>;
-    /// Whether the account's password login is disabled right now.
-    fn login_disabled(&mut self, user: &str) -> anyhow::Result<bool>;
+    /// The account's password login right now.
+    fn login(&mut self, user: &str) -> anyhow::Result<Login>;
     fn disable_login(&mut self, user: &str) -> anyhow::Result<()>;
     fn enable_login(&mut self, user: &str) -> anyhow::Result<()>;
     /// On the desktop and, on a streaming host, in the stream. Failures are logged by the implementation.
@@ -57,6 +66,8 @@ pub trait Actions {
     fn unblock_stream(&mut self, user: &str) -> anyhow::Result<()>;
     /// Empty turns the banner off.
     fn set_banner(&mut self, lines: &[String]) -> anyhow::Result<()>;
+    /// Writes the state to disk now. Called before disabling a login, so the record of it can't be lost.
+    fn persist(&mut self, state: &Persisted) -> anyhow::Result<()>;
 }
 
 /// Survives restarts, in the state file.
@@ -83,6 +94,11 @@ struct Live {
     games_closed_on: Option<NaiveDate>,
     /// Login was already disabled by someone else when we blocked: leave it alone.
     external_lock: bool,
+    /// Sessions seen locked (or locked by us) while blocked: one of these found unlocked was unlocked from inside.
+    locked_sessions: BTreeSet<String>,
+    /// Unlocks while blocked, and when the last was reported.
+    unlocks: u64,
+    unlock_reported_at: Option<NaiveDateTime>,
     overrun: Vec<String>,
     errors: Vec<String>,
 }
@@ -93,6 +109,8 @@ pub struct Enforcer {
     banner: Option<Vec<String>>,
     /// The last error setting the banner: a repeat is logged quietly, since it is retried every tick.
     banner_error: Option<String>,
+    /// Problems reported once per process, keyed by kind and account.
+    reported: BTreeSet<String>,
     dirty: bool,
 }
 
@@ -104,6 +122,7 @@ impl Enforcer {
             live: BTreeMap::new(),
             banner: None,
             banner_error: None,
+            reported: BTreeSet::new(),
             dirty: false,
         }
     }
@@ -125,6 +144,14 @@ impl Enforcer {
             self.persisted.clock_offset_secs = offset;
             self.dirty = true;
         }
+        // The server sends every account in the report: one it left out has no rules any more
+        let before = self.persisted.snapshots.len();
+        self.persisted
+            .snapshots
+            .retain(|user, _| response.accounts.iter().any(|a| &a.user == user));
+        if self.persisted.snapshots.len() != before {
+            self.dirty = true;
+        }
         for snap in &response.accounts {
             // The server's figure now includes everything this PC reported
             let live = self.live.entry(snap.user.clone()).or_default();
@@ -135,6 +162,15 @@ impl Enforcer {
                     .insert(snap.user.clone(), snap.clone());
                 self.dirty = true;
             }
+        }
+    }
+
+    /// The server answered without rules (an old server, after a rollback): enforce nothing. The next tick
+    /// releases everything.
+    pub fn clear_snapshots(&mut self) {
+        if !self.persisted.snapshots.is_empty() {
+            self.persisted.snapshots.clear();
+            self.dirty = true;
         }
     }
 
@@ -168,6 +204,7 @@ impl Enforcer {
         act: &mut dyn Actions,
     ) {
         let now = local_now + chrono::Duration::seconds(self.persisted.clock_offset_secs);
+        self.forget_untracked(observations, act);
         let mut banner = Vec::new();
         for o in observations {
             let snap = match self.persisted.snapshots.get(&o.user) {
@@ -186,9 +223,10 @@ impl Enforcer {
             if blocked {
                 let reason = blocked_reason(&snap, &decision, now);
                 banner.push(format!("{}: computer time is over {reason}", o.user));
-                self.block(o, &reason, act);
+                self.block(o, &reason, now, act);
             } else {
                 self.let_go(&o.user, act);
+                self.check_login_is_ours(&o.user, act);
                 if present {
                     self.warn_before_lock(o, &snap, &decision, now, act);
                 }
@@ -210,6 +248,51 @@ impl Enforcer {
                         self.banner_error = Some(text);
                     }
                 }
+            }
+        }
+    }
+
+    /// Accounts this agent is blocking right now.
+    pub fn blocked_users(&self) -> Vec<String> {
+        self.live
+            .iter()
+            .filter(|(_, l)| l.blocked)
+            .map(|(u, _)| u.clone())
+            .collect()
+    }
+
+    /// The fast re-lock check for a blocked account: locks any of `sessions` that isn't locked. The kid can
+    /// unlock their own session from inside it, so this runs every second, between enforcement ticks.
+    pub fn relock(
+        &mut self,
+        local_now: NaiveDateTime,
+        user: &str,
+        sessions: &[SessionInfo],
+        act: &mut dyn Actions,
+    ) {
+        if !self.live.get(user).is_some_and(|l| l.blocked) {
+            return;
+        }
+        let now = local_now + chrono::Duration::seconds(self.persisted.clock_offset_secs);
+        self.lock_sessions(now, user, sessions, act);
+    }
+
+    /// An account no longer tracked (taken out of the config) gets everything undone and its rules dropped.
+    fn forget_untracked(&mut self, observations: &[Observation], act: &mut dyn Actions) {
+        let tracked: BTreeSet<&str> = observations.iter().map(|o| o.user.as_str()).collect();
+        let untracked: BTreeSet<String> = self
+            .persisted
+            .login_disabled
+            .iter()
+            .chain(&self.persisted.streams_blocked)
+            .chain(self.persisted.snapshots.keys())
+            .filter(|u| !tracked.contains(u.as_str()))
+            .cloned()
+            .collect();
+        for user in untracked {
+            self.let_go(&user, act);
+            if self.persisted.snapshots.remove(&user).is_some() {
+                self.dirty = true;
             }
         }
     }
@@ -285,7 +368,7 @@ impl Enforcer {
         rules::decide(&day, &snap.blackouts, &used, now)
     }
 
-    fn block(&mut self, o: &Observation, reason: &str, act: &mut dyn Actions) {
+    fn block(&mut self, o: &Observation, reason: &str, now: NaiveDateTime, act: &mut dyn Actions) {
         let user = &o.user;
         let first = !self.live.get(user).is_some_and(|l| l.blocked);
         if first {
@@ -293,27 +376,43 @@ impl Enforcer {
             live.blocked = true;
             live.external_lock = false;
             if !self.persisted.login_disabled.contains(user) {
-                match act.login_disabled(user) {
-                    Ok(true) => self.live.get_mut(user).unwrap().external_lock = true,
-                    Ok(false) => self.disable(user, act),
+                match act.login(user) {
+                    Ok(Login::Disabled) => {
+                        self.live.get_mut(user).unwrap().external_lock = true;
+                        self.report_once(
+                            user,
+                            "already-locked",
+                            format!(
+                                "{user}'s login was already disabled when kidtime blocked it; kidtime won't re-enable it"
+                            ),
+                        );
+                    }
+                    Ok(Login::NoPassword) => {
+                        self.live.get_mut(user).unwrap().external_lock = true;
+                        self.report_once(
+                            user,
+                            "no-password",
+                            "can't disable login: no password; only the screen lock applies".into(),
+                        );
+                    }
+                    Ok(Login::Enabled) => self.disable(user, act),
                     Err(e) => self.error(user, format!("checking login failed: {e:#}")),
                 }
             }
-            act.notify(user, &format!("Computer time is over {reason}"));
         } else if !self.live[user].external_lock {
             // A failed disable (or check) is retried every tick
-            if let Ok(false) = act.login_disabled(user) {
+            if let Ok(Login::Enabled) = act.login(user) {
                 self.disable(user, act);
             }
         }
-        for s in o.sessions.iter().filter(|s| !s.locked) {
-            if let Err(e) = act.lock_session(&s.id) {
-                self.error(user, format!("lock failed: {e:#}"));
-            }
+        self.lock_sessions(now, user, &o.sessions, act);
+        // After the locks, so nothing can delay them
+        if first {
+            act.notify(user, &format!("Computer time is over {reason}"));
         }
-        // Also on the first blocked tick of this process when already recorded: the nftables table
-        // does not survive a reboot (adding the rules is idempotent)
-        if o.streaming_host && (first || !self.persisted.streams_blocked.contains(user)) {
+        // Every blocked tick: the nftables table does not survive a reboot, and the rules may have been
+        // removed or the kid's port changed. block_stream checks the rules and repairs only what is wrong.
+        if o.streaming_host {
             match act.block_stream(user) {
                 Ok(()) => {
                     if self.persisted.streams_blocked.insert(user.clone()) {
@@ -325,10 +424,71 @@ impl Enforcer {
         }
     }
 
-    /// Records the account as disabled by us *before* disabling it, so a disable that took effect but reported
-    /// failure is still undone later (re-enabling an account that was enabled is harmless).
+    /// Locks every unlocked session. A session that was locked before and is unlocked now was unlocked from
+    /// inside (logind lets the owner do that): reported, at most once a minute per account.
+    fn lock_sessions(
+        &mut self,
+        now: NaiveDateTime,
+        user: &str,
+        sessions: &[SessionInfo],
+        act: &mut dyn Actions,
+    ) {
+        let live = self.live.entry(user.to_string()).or_default();
+        live.locked_sessions
+            .retain(|id| sessions.iter().any(|s| &s.id == id));
+        let mut unlocked = false;
+        let mut failures = Vec::new();
+        for s in sessions {
+            if s.locked {
+                live.locked_sessions.insert(s.id.clone());
+                continue;
+            }
+            unlocked |= live.locked_sessions.remove(&s.id);
+            match act.lock_session(&s.id) {
+                Ok(()) => {
+                    live.locked_sessions.insert(s.id.clone());
+                }
+                Err(e) => failures.push(format!("lock failed: {e:#}")),
+            }
+        }
+        let mut report = false;
+        if unlocked {
+            live.unlocks += 1;
+            tracing::warn!(
+                "{user} unlocked a session while blocked ({} times in this process)",
+                live.unlocks
+            );
+            if live
+                .unlock_reported_at
+                .is_none_or(|t| (now - t).num_seconds() >= 60)
+            {
+                live.unlock_reported_at = Some(now);
+                report = true;
+            }
+        }
+        for f in failures {
+            self.error(user, f);
+        }
+        if report {
+            self.error(user, format!("{user} unlocked the session while blocked"));
+        }
+    }
+
+    /// Records the account as disabled by us, and writes that to disk, *before* disabling it: a disable that took
+    /// effect but reported failure is still undone later (re-enabling an account that was enabled is harmless),
+    /// and a crash right after the disable can't lose the record. If the record can't be saved, the login stays
+    /// enabled (the session lock still applies) and the disable is retried next tick.
     fn disable(&mut self, user: &str, act: &mut dyn Actions) {
+        // Already recorded (a retry): the record went to disk when it was added
         if self.persisted.login_disabled.insert(user.to_string()) {
+            if let Err(e) = act.persist(&self.persisted) {
+                self.persisted.login_disabled.remove(user);
+                self.error(
+                    user,
+                    format!("couldn't save state; not disabling login: {e:#}"),
+                );
+                return;
+            }
             self.dirty = true;
         }
         if let Err(e) = act.disable_login(user) {
@@ -341,6 +501,7 @@ impl Enforcer {
         if let Some(live) = self.live.get_mut(user) {
             live.blocked = false;
             live.external_lock = false;
+            live.locked_sessions.clear();
         }
         if self.persisted.login_disabled.contains(user) {
             match act.enable_login(user) {
@@ -359,6 +520,32 @@ impl Enforcer {
                 }
                 Err(e) => self.error(user, format!("restoring the stream failed: {e:#}")),
             }
+        }
+    }
+
+    /// For an allowed account: a disabled login kidtime didn't record is someone else's doing (or a lost record).
+    /// It is never undone automatically, only reported.
+    fn check_login_is_ours(&mut self, user: &str, act: &mut dyn Actions) {
+        if self.persisted.login_disabled.contains(user)
+            || self.reported.contains(&format!("unrecorded-lock:{user}"))
+        {
+            return;
+        }
+        if let Ok(Login::Disabled) = act.login(user) {
+            self.report_once(
+                user,
+                "unrecorded-lock",
+                format!(
+                    "login for {user} is disabled but kidtime didn't do it; if it should be enabled run `sudo usermod -U {user}`"
+                ),
+            );
+        }
+    }
+
+    /// An error for the dashboard, at most once per process for this kind and account.
+    fn report_once(&mut self, user: &str, kind: &str, message: String) {
+        if self.reported.insert(format!("{kind}:{user}")) {
+            self.error(user, message);
         }
     }
 
@@ -528,7 +715,11 @@ fn next_allowed(snap: &AccountSnapshot, now: NaiveDateTime) -> Option<NaiveDateT
     None
 }
 
+/// "9:00pm", "12:15am", and "midnight" for 00:00.
 fn minute_clock(minutes: u16) -> String {
+    if minutes == 0 {
+        return "midnight".into();
+    }
     let (h, m) = (u32::from(minutes) / 60, u32::from(minutes) % 60);
     format!(
         "{}:{m:02}{}",
@@ -537,10 +728,16 @@ fn minute_clock(minutes: u16) -> String {
     )
 }
 
-/// "9:00pm" today, "Sat 9:00am" another day.
+/// "9:00pm" today, "Sat 9:00am" another day, "midnight" for the coming one (the start of tomorrow).
+/// A midnight further off reads "Thu 12:00am": "Thu midnight" could mean either end of Thursday.
 fn clock(t: NaiveDateTime, now: NaiveDateTime) -> String {
-    let time = minute_clock((t.hour() * 60 + t.minute()) as u16);
-    if t.date() == now.date() {
+    let minutes = (t.hour() * 60 + t.minute()) as u16;
+    let tomorrow = now.date().succ_opt();
+    if minutes == 0 && t.date() != now.date() && Some(t.date()) != tomorrow {
+        return format!("{} 12:00am", t.format("%a"));
+    }
+    let time = minute_clock(minutes);
+    if t.date() == now.date() || minutes == 0 {
         time
     } else {
         format!("{} {time}", t.format("%a"))
@@ -558,11 +755,15 @@ mod tests {
     struct Fake {
         calls: Vec<String>,
         already_locked: BTreeSet<String>,
+        no_password: BTreeSet<String>,
         fail_lock: bool,
         fail_disable: bool,
         fail_enable: bool,
         fail_banner: bool,
+        fail_persist: bool,
         banner: Vec<String>,
+        /// The last state persisted.
+        persisted: Option<Persisted>,
     }
 
     impl Actions for Fake {
@@ -574,8 +775,14 @@ mod tests {
                 Ok(())
             }
         }
-        fn login_disabled(&mut self, user: &str) -> anyhow::Result<bool> {
-            Ok(self.already_locked.contains(user))
+        fn login(&mut self, user: &str) -> anyhow::Result<Login> {
+            Ok(if self.no_password.contains(user) {
+                Login::NoPassword
+            } else if self.already_locked.contains(user) {
+                Login::Disabled
+            } else {
+                Login::Enabled
+            })
         }
         fn disable_login(&mut self, user: &str) -> anyhow::Result<()> {
             self.calls.push(format!("disable {user}"));
@@ -614,6 +821,14 @@ mod tests {
                 anyhow::bail!("dconf said no");
             }
             self.banner = lines.to_vec();
+            Ok(())
+        }
+        fn persist(&mut self, state: &Persisted) -> anyhow::Result<()> {
+            self.calls.push("persist".into());
+            if self.fail_persist {
+                anyhow::bail!("disk full");
+            }
+            self.persisted = Some(state.clone());
             Ok(())
         }
     }
@@ -759,9 +974,10 @@ mod tests {
         assert_eq!(
             fake.take(),
             [
+                "persist",
                 "disable kid1",
-                "notify kid1: Computer time is over until Tue 6:15am",
                 "lock 7",
+                "notify kid1: Computer time is over until Tue 6:15am",
                 "banner kid1: computer time is over until Tue 6:15am",
             ]
         );
@@ -844,11 +1060,10 @@ mod tests {
         assert!(fake.calls.contains(&"block kid1".to_string()));
         assert!(e.persisted.streams_blocked.contains("kid1"));
         fake.take();
+        // Checked and repaired every tick (block_stream is idempotent); the record stays, nothing else repeats
         e.tick(at(21, 1), std::slice::from_ref(&o), &mut fake);
-        assert!(
-            !fake.calls.contains(&"block kid1".to_string()),
-            "blocked once, not every tick"
-        );
+        assert_eq!(fake.take(), ["block kid1"]);
+        assert!(e.persisted.streams_blocked.contains("kid1"));
         e.persisted.snapshots.get_mut("kid1").unwrap().enforce = false;
         e.tick(at(21, 2), &[o], &mut fake);
         assert!(fake.calls.contains(&"unblock kid1".to_string()));
@@ -1116,7 +1331,7 @@ mod tests {
         e.tick(at(21, 0), std::slice::from_ref(&o), &mut fake);
         assert!(fake.take().contains(&"block kid1".to_string()));
         e.tick(at(21, 1), &[o], &mut fake);
-        assert!(!fake.take().contains(&"block kid1".to_string()));
+        assert_eq!(fake.take(), ["block kid1"]);
         assert!(e.persisted.streams_blocked.contains("kid1"));
     }
 
@@ -1190,6 +1405,20 @@ mod tests {
         assert!(!fake.calls.iter().any(|c| c.starts_with("banner")));
     }
 
+    #[test]
+    fn midnight_reads_midnight() {
+        assert_eq!(minute_clock(0), "midnight");
+        assert_eq!(minute_clock(15), "12:15am");
+        assert_eq!(minute_clock(720), "12:00pm");
+        // Tonight's midnight needs no day name; one further away keeps it, as a time
+        assert_eq!(clock(tuesday(0, 0), at(23, 50)), "midnight");
+        assert_eq!(
+            clock(tuesday(0, 0) + chrono::Days::new(2), at(23, 50)),
+            "Thu 12:00am"
+        );
+        assert_eq!(clock(tuesday(9, 0), at(23, 50)), "Tue 9:00am");
+    }
+
     fn rule_from(start_min: u16, end_min: u16) -> DayRule {
         DayRule {
             restricted: true,
@@ -1230,7 +1459,7 @@ mod tests {
         assert_eq!(
             fake.take(),
             [
-                "notify kid1: 10 minutes left today: the computer locks at Tue 12:00am",
+                "notify kid1: 10 minutes left today: the computer locks at midnight",
                 "banner "
             ]
         );
@@ -1238,9 +1467,10 @@ mod tests {
         assert_eq!(
             fake.take(),
             [
+                "persist",
                 "disable kid1",
-                "notify kid1: Computer time is over until 10:00am",
                 "lock 7",
+                "notify kid1: Computer time is over until 10:00am",
                 "banner kid1: computer time is over until 10:00am"
             ]
         );
@@ -1256,7 +1486,7 @@ mod tests {
         assert!(fake.calls.contains(&"disable kid1".to_string()));
         assert!(
             fake.calls
-                .contains(&"notify kid1: Computer time is over until Wed 12:00am".to_string())
+                .contains(&"notify kid1: Computer time is over until midnight".to_string())
         );
         let mut e = enforcer(
             vec![{
@@ -1269,6 +1499,252 @@ mod tests {
         let mut fake = Fake::default();
         e.tick(tuesday(12, 0), &[obs("kid1", false, vec![])], &mut fake);
         assert_eq!(fake.take(), ["banner "]);
+    }
+
+    #[test]
+    fn the_record_is_on_disk_before_login_is_disabled() {
+        let mut e = enforcer(vec![snapshot("kid1", evenings())], at(20, 0));
+        let mut fake = Fake::default();
+        e.tick(at(21, 0), &[obs("kid1", false, vec![])], &mut fake);
+        let calls = fake.take();
+        let persist = calls.iter().position(|c| c == "persist");
+        let disable = calls.iter().position(|c| c == "disable kid1");
+        assert!(
+            persist.is_some() && persist < disable,
+            "persist before disable: {calls:?}"
+        );
+        assert!(
+            fake.persisted
+                .as_ref()
+                .is_some_and(|p| p.login_disabled.contains("kid1")),
+            "the persisted state records the disable"
+        );
+    }
+
+    #[test]
+    fn login_is_not_disabled_when_the_record_cant_be_saved() {
+        let mut e = enforcer(vec![snapshot("kid1", evenings())], at(20, 0));
+        let mut fake = Fake {
+            fail_persist: true,
+            ..Default::default()
+        };
+        e.tick(at(21, 0), &[obs("kid1", false, vec![])], &mut fake);
+        let calls = fake.take();
+        assert!(!calls.contains(&"disable kid1".to_string()), "{calls:?}");
+        assert!(
+            calls.contains(&"lock 7".to_string()),
+            "the lock still applies"
+        );
+        assert!(e.persisted.login_disabled.is_empty());
+        assert_eq!(
+            e.take_errors("kid1"),
+            ["couldn't save state; not disabling login: disk full"]
+        );
+        // Retried on the next tick, and done once the disk works again
+        fake.fail_persist = false;
+        e.tick(at(21, 1), &[obs("kid1", true, vec![])], &mut fake);
+        assert_eq!(fake.take(), ["persist", "disable kid1"]);
+        assert!(e.persisted.login_disabled.contains("kid1"));
+    }
+
+    #[test]
+    fn a_login_disabled_behind_kidtimes_back_is_reported_once() {
+        let mut e = enforcer(vec![snapshot("kid1", evenings())], at(12, 0));
+        let mut fake = Fake {
+            already_locked: BTreeSet::from(["kid1".into()]),
+            ..Default::default()
+        };
+        e.tick(at(12, 0), &[obs("kid1", false, vec![])], &mut fake);
+        assert_eq!(
+            e.take_errors("kid1"),
+            [
+                "login for kid1 is disabled but kidtime didn't do it; if it should be enabled run `sudo usermod -U kid1`"
+            ]
+        );
+        e.tick(at(12, 1), &[obs("kid1", false, vec![])], &mut fake);
+        assert!(e.take_errors("kid1").is_empty(), "once per process");
+        assert!(!fake.calls.iter().any(|c| c.starts_with("enable")));
+    }
+
+    fn session(id: &str, locked: bool) -> SessionInfo {
+        SessionInfo {
+            id: id.into(),
+            locked,
+        }
+    }
+
+    #[test]
+    fn the_fast_check_relocks_and_reports_unlocks_once_a_minute() {
+        let mut e = enforcer(vec![snapshot("kid1", evenings())], at(20, 0));
+        let mut fake = Fake::default();
+        assert!(e.blocked_users().is_empty());
+        e.tick(at(21, 0), &[obs("kid1", false, vec![])], &mut fake);
+        assert_eq!(e.blocked_users(), ["kid1"]);
+        e.take_errors("kid1");
+        fake.take();
+        // Still locked: nothing to do
+        e.relock(at(21, 0), "kid1", &[session("7", true)], &mut fake);
+        assert!(fake.take().is_empty());
+        assert!(e.take_errors("kid1").is_empty());
+        // The kid unlocked it from inside the session
+        let t = at(21, 0) + chrono::Duration::seconds(3);
+        e.relock(t, "kid1", &[session("7", false)], &mut fake);
+        assert_eq!(fake.take(), ["lock 7"]);
+        assert_eq!(
+            e.take_errors("kid1"),
+            ["kid1 unlocked the session while blocked"]
+        );
+        // Again 20 seconds later: locked again, not reported again yet
+        let t = t + chrono::Duration::seconds(20);
+        e.relock(t, "kid1", &[session("7", false)], &mut fake);
+        assert_eq!(fake.take(), ["lock 7"]);
+        assert!(e.take_errors("kid1").is_empty());
+        // A minute after the report: reported again
+        let t = t + chrono::Duration::seconds(41);
+        e.relock(t, "kid1", &[session("7", false)], &mut fake);
+        assert_eq!(fake.take(), ["lock 7"]);
+        assert_eq!(
+            e.take_errors("kid1"),
+            ["kid1 unlocked the session while blocked"]
+        );
+        // Allowed again: no longer blocked, and the fast check does nothing
+        e.tick(tuesday(6, 15), &[obs("kid1", true, vec![])], &mut fake);
+        assert!(e.blocked_users().is_empty());
+        fake.take();
+        e.relock(tuesday(6, 15), "kid1", &[session("7", false)], &mut fake);
+        assert!(fake.take().is_empty());
+    }
+
+    #[test]
+    fn a_lock_that_failed_is_not_reported_as_an_unlock() {
+        let mut e = enforcer(vec![snapshot("kid1", evenings())], at(20, 0));
+        let mut fake = Fake {
+            fail_lock: true,
+            ..Default::default()
+        };
+        e.tick(at(21, 0), &[obs("kid1", false, vec![])], &mut fake);
+        e.take_errors("kid1");
+        e.relock(at(21, 0), "kid1", &[session("7", false)], &mut fake);
+        assert_eq!(e.take_errors("kid1"), ["lock failed: logind said no"]);
+        // The 5-second tick seeing the kid unlock a session that was locked counts too
+        fake.fail_lock = false;
+        e.tick(at(21, 1), &[obs("kid1", true, vec![])], &mut fake);
+        e.tick(at(21, 2), &[obs("kid1", false, vec![])], &mut fake);
+        assert_eq!(
+            e.take_errors("kid1"),
+            ["kid1 unlocked the session while blocked"]
+        );
+    }
+
+    #[test]
+    fn a_response_without_an_account_drops_its_rules() {
+        let mut e = enforcer(
+            vec![snapshot("kid1", evenings()), snapshot("kid2", evenings())],
+            at(20, 0),
+        );
+        let mut fake = Fake::default();
+        let both = [obs("kid1", true, vec![]), obs("kid2", true, vec![])];
+        e.tick(at(21, 0), &both, &mut fake);
+        fake.take();
+        e.apply_response(
+            &ReportResponse {
+                server_time: at(21, 1),
+                accounts: vec![snapshot("kid2", evenings())],
+            },
+            at(21, 1),
+        );
+        assert!(!e.persisted.snapshots.contains_key("kid1"));
+        assert!(e.take_dirty());
+        e.tick(at(21, 1), &both, &mut fake);
+        assert!(fake.take().contains(&"enable kid1".to_string()));
+        assert!(e.persisted.login_disabled.contains("kid2"));
+    }
+
+    #[test]
+    fn a_reply_without_rules_releases_everything() {
+        let mut e = enforcer(vec![snapshot("kid1", evenings())], at(20, 0));
+        let mut fake = Fake::default();
+        e.tick(at(21, 0), &[obs("kid1", true, vec![])], &mut fake);
+        e.take_dirty();
+        fake.take();
+        e.clear_snapshots();
+        assert!(e.persisted.snapshots.is_empty());
+        assert!(e.take_dirty());
+        e.tick(at(21, 1), &[obs("kid1", true, vec![])], &mut fake);
+        assert_eq!(fake.take(), ["enable kid1", "banner "]);
+    }
+
+    #[test]
+    fn a_kid_removed_from_the_config_is_released() {
+        let mut e = enforcer(
+            vec![snapshot("kid1", evenings()), snapshot("kid2", evenings())],
+            at(20, 0),
+        );
+        let mut fake = Fake::default();
+        let mut o1 = obs("kid1", true, vec![]);
+        o1.streaming_host = true;
+        let mut o2 = obs("kid2", true, vec![]);
+        o2.streaming_host = true;
+        e.tick(at(21, 0), &[o1, o2.clone()], &mut fake);
+        assert!(e.persisted.login_disabled.contains("kid1"));
+        assert!(e.persisted.streams_blocked.contains("kid1"));
+        fake.take();
+        // kid1 is no longer tracked: everything done to it is undone, and its rules are dropped
+        e.tick(at(21, 1), &[o2], &mut fake);
+        let calls = fake.take();
+        assert!(calls.contains(&"enable kid1".to_string()), "{calls:?}");
+        assert!(calls.contains(&"unblock kid1".to_string()), "{calls:?}");
+        assert!(!calls.contains(&"enable kid2".to_string()));
+        assert!(!e.persisted.login_disabled.contains("kid1"));
+        assert!(!e.persisted.streams_blocked.contains("kid1"));
+        assert!(!e.persisted.snapshots.contains_key("kid1"));
+        assert!(e.persisted.snapshots.contains_key("kid2"));
+        assert_eq!(
+            fake.banner,
+            ["kid2: computer time is over until Tue 6:15am"]
+        );
+    }
+
+    #[test]
+    fn a_kid_without_a_password_gets_the_lock_only_and_a_dashboard_error() {
+        let mut e = enforcer(vec![snapshot("kid1", evenings())], at(20, 0));
+        let mut fake = Fake {
+            no_password: BTreeSet::from(["kid1".into()]),
+            ..Default::default()
+        };
+        e.tick(at(21, 0), &[obs("kid1", false, vec![])], &mut fake);
+        let calls = fake.take();
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c == "persist" || c.starts_with("disable"))
+        );
+        assert!(calls.contains(&"lock 7".to_string()));
+        assert_eq!(
+            e.take_errors("kid1"),
+            ["can't disable login: no password; only the screen lock applies"]
+        );
+        // Unblocked and blocked again: not repeated in this process
+        e.tick(tuesday(6, 15), &[obs("kid1", true, vec![])], &mut fake);
+        e.tick(tuesday(22, 0), &[obs("kid1", true, vec![])], &mut fake);
+        assert!(e.take_errors("kid1").is_empty());
+        assert!(!fake.calls.iter().any(|c| c.starts_with("enable")));
+    }
+
+    #[test]
+    fn an_account_already_locked_when_blocked_is_a_dashboard_error() {
+        let mut e = enforcer(vec![snapshot("kid1", evenings())], at(20, 0));
+        let mut fake = Fake {
+            already_locked: BTreeSet::from(["kid1".into()]),
+            ..Default::default()
+        };
+        e.tick(at(21, 0), &[obs("kid1", false, vec![])], &mut fake);
+        assert_eq!(
+            e.take_errors("kid1"),
+            [
+                "kid1's login was already disabled when kidtime blocked it; kidtime won't re-enable it"
+            ]
+        );
     }
 
     #[test]
