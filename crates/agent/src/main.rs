@@ -1,6 +1,7 @@
 //! kidtime-agent: samples which tracked users are active and what they're
 //! running, and reports it to the kidtime server.
 
+mod actions;
 mod apps;
 mod enforce;
 mod logind;
