@@ -238,6 +238,8 @@ rulesEl.addEventListener("change", async (e) => {
       box.checked = false;
       return;
     }
+    // No second change while this one is saving: a late failure would flip the box back over it
+    box.disabled = true;
     try {
       await api(`/api/accounts/${encodeURIComponent(rulesUser)}/enforce`, { method: "PUT", body: { enforce: box.checked } });
     } catch (err) {
@@ -245,6 +247,8 @@ rulesEl.addEventListener("change", async (e) => {
       // A TypeError is fetch failing to reach the server; its own text ("Failed to fetch") means little here
       error.textContent = err instanceof TypeError ? "Couldn't save. Try again." : err.message || "Couldn't save. Try again.";
       error.hidden = false;
+    } finally {
+      box.disabled = false;
     }
     return;
   }
