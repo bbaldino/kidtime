@@ -7,6 +7,12 @@ use serde::{Deserialize, Serialize};
 
 pub type CategoryId = i64;
 
+/// The one category created at first start.
+pub const GAMES: CategoryId = 1;
+/// Apps a person has marked as not worth tracking: hidden from the dashboard and never budgeted.
+/// Their time is still recorded, so moving one back restores its history.
+pub const IGNORED: CategoryId = 2;
+
 /// An allowed stretch of a day, in minutes after local midnight. The end is exclusive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Stretch {

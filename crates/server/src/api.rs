@@ -11,7 +11,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::AppState;
-use crate::rules::{self, CategoryId, DayRule, Invalid};
+use protocol::rules::{self, CategoryId, DayRule, Invalid};
 
 pub enum ApiError {
     NotFound,

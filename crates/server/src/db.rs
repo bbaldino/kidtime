@@ -15,13 +15,8 @@ use protocol::{App, Report, Sample, UserSample, UserState};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-use crate::rules::{self, BlackoutSpan, CategoryId, Computer, DayRule, Decision, Stretch};
-
-/// The one category created at first start.
-pub const GAMES: CategoryId = 1;
-/// Apps a person has marked as not worth tracking: hidden from the dashboard and never budgeted.
-/// Their time is still recorded, so moving one back restores its history.
-pub const IGNORED: CategoryId = 2;
+use protocol::rules::{self, BlackoutSpan, CategoryId, Computer, DayRule, Decision, Stretch};
+pub use protocol::rules::{GAMES, IGNORED};
 
 #[derive(Debug, Serialize)]
 pub struct AppEntry {
@@ -1262,7 +1257,7 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
     }
 
-    use crate::rules::{CategoryStatus, Computer, DayRule, Decision, Stretch};
+    use protocol::rules::{CategoryStatus, Computer, DayRule, Decision, Stretch};
 
     fn noon_today() -> chrono::NaiveDateTime {
         Local::now().date_naive().and_hms_opt(12, 0, 0).unwrap()

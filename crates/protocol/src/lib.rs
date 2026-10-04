@@ -1,5 +1,7 @@
 //! Wire types shared by the kidtime agent and server.
 
+pub mod rules;
+
 use serde::{Deserialize, Serialize};
 
 /// A batch of samples sent from one agent to the server.

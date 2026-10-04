@@ -3,7 +3,6 @@
 mod api;
 mod auth;
 mod db;
-mod rules;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -296,7 +295,7 @@ struct UserStatus {
     /// Whether the account has any rule.
     restricted: bool,
     /// None if it couldn't be worked out; the other accounts are still returned.
-    decision: Option<rules::Decision>,
+    decision: Option<protocol::rules::Decision>,
 }
 
 #[derive(Serialize)]
