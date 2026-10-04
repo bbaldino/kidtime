@@ -74,7 +74,11 @@ pub async fn get_rules(
     if !db.is_account(&user)? {
         return Err(ApiError::NotFound);
     }
-    Ok(Json(json!({ "user": user, "days": db.week_rules(&user)? })))
+    Ok(Json(json!({
+        "user": user,
+        "enforce": db.enforce(&user)?,
+        "days": db.week_rules(&user)?,
+    })))
 }
 
 pub async fn put_rule(
@@ -96,6 +100,24 @@ pub async fn put_rule(
         return Err(invalid("budgets", "ignored apps can't have a budget"));
     }
     db.set_day_rule(&user, weekday, &rule)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+pub struct SetEnforce {
+    enforce: bool,
+}
+
+pub async fn put_enforce(
+    State(state): State<Arc<AppState>>,
+    Path(user): Path<String>,
+    Json(set): Json<SetEnforce>,
+) -> Api<StatusCode> {
+    let mut db = state.db.lock().unwrap();
+    if !db.is_account(&user)? {
+        return Err(ApiError::NotFound);
+    }
+    db.set_enforce(&user, set.enforce)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -350,7 +372,7 @@ mod tests {
             .body(Body::from(body.to_string()))
             .unwrap();
         let response = router(app.state.clone()).oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -395,7 +417,7 @@ mod tests {
             .body(Body::from(body.to_string()))
             .unwrap();
         let response = router(app.state.clone()).oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -715,6 +737,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn report_answers_with_a_snapshot_per_account() {
+        let app = app("snapshot-response");
+        report_for(&app, "kid1").await;
+        call(
+            &app,
+            "PUT",
+            "/api/accounts/kid1/enforce",
+            Some(json!({ "enforce": true })),
+        )
+        .await;
+        let at = chrono::Local::now().timestamp();
+        let body = json!({ "host": "host-a", "agent_id": "kid1", "interval_secs": 15, "samples": [{
+            "seq": 2, "at": at, "elapsed_secs": 15,
+            "users": [{ "user": "kid1", "state": "active", "apps": [] }, { "user": "kid2", "state": "offline", "apps": [] }],
+        }]});
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/report")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer token")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = router(app.state.clone()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: protocol::ReportResponse = serde_json::from_slice(&bytes).unwrap();
+        let users: Vec<&str> = parsed.accounts.iter().map(|a| a.user.as_str()).collect();
+        assert_eq!(users, ["kid1", "kid2"]);
+        assert!(parsed.accounts[0].enforce);
+        assert!(!parsed.accounts[1].enforce);
+    }
+
+    #[tokio::test]
+    async fn enforce_switch_round_trips_through_rules() {
+        let app = app("enforce-api");
+        report_for(&app, "kid1").await;
+        assert_eq!(
+            call(&app, "GET", "/api/rules/kid1", None).await.1["enforce"],
+            false
+        );
+        let (status, _) = call(
+            &app,
+            "PUT",
+            "/api/accounts/kid1/enforce",
+            Some(json!({ "enforce": true })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(
+            call(&app, "GET", "/api/rules/kid1", None).await.1["enforce"],
+            true
+        );
+        assert_eq!(
+            call(
+                &app,
+                "PUT",
+                "/api/accounts/nobody/enforce",
+                Some(json!({ "enforce": true }))
+            )
+            .await
+            .0,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn status_carries_enforce_overrun_and_errors() {
+        let app = app("status-extras");
+        let at = chrono::Local::now().timestamp();
+        let body = json!({ "host": "host-a", "agent_id": "a", "interval_secs": 15, "samples": [{
+            "seq": 1, "at": at, "elapsed_secs": 15,
+            "users": [{ "user": "kid1", "state": "active", "apps": [], "overrun": ["Terminal"], "errors": ["lock failed: x"] }],
+        }]});
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/report")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer token")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        router(app.state.clone()).oneshot(request).await.unwrap();
+        let user = &call(&app, "GET", "/api/status", None).await.1["users"][0];
+        assert_eq!(user["enforce"], false);
+        assert_eq!(user["overrun"], json!(["Terminal"]));
+        assert_eq!(user["errors"], json!(["lock failed: x"]));
+    }
+
+    #[tokio::test]
     async fn a_blackout_that_has_already_ended_is_rejected() {
         let app = app("blackout-past");
         report(&app, "steam:1").await;
@@ -796,6 +906,7 @@ mod tests {
             ("GET", "/api/status"),
             ("GET", "/api/rules/kid1"),
             ("PUT", "/api/rules/kid1/0"),
+            ("PUT", "/api/accounts/kid1/enforce"),
             ("POST", "/api/rules/kid1/copy"),
             ("POST", "/api/rules/kid1/copy-to"),
             ("GET", "/api/blackouts"),

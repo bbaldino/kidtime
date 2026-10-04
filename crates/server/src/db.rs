@@ -49,6 +49,9 @@ pub struct Event {
     /// "locked", "closed" or "allowed". Rows of kind "state" are never returned.
     pub kind: String,
     pub detail: String,
+    /// Whether Enforce was on for the account when this happened.
+    pub enforced: bool,
+    pub host: String,
 }
 
 const KEEP_SECS: i64 = 30 * 86400;
@@ -63,6 +66,15 @@ const MAX_APPS_PER_USER: usize = 50;
 
 fn clip(text: &str) -> String {
     text.chars().take(MAX_NAME_CHARS).collect()
+}
+
+/// Each string clipped, and only the first `MAX_APPS_PER_USER` kept.
+fn clipped_list(items: &[String]) -> Vec<String> {
+    items
+        .iter()
+        .take(MAX_APPS_PER_USER)
+        .map(|item| clip(item))
+        .collect()
 }
 
 /// A copy of the report with what agents send cut down to what is worth storing: long names are
@@ -83,8 +95,8 @@ fn sanitised(report: &Report) -> Report {
                     .users
                     .iter()
                     .map(|user| UserSample {
-                        overrun: Vec::new(),
-                        errors: Vec::new(),
+                        overrun: clipped_list(&user.overrun),
+                        errors: clipped_list(&user.errors),
                         user: clip(&user.user),
                         state: user.state,
                         apps: user
@@ -117,6 +129,26 @@ fn decision_key(decision: &Decision) -> String {
         .map(|c| c.category.to_string())
         .collect();
     format!("{computer}|{}", used_up.join(","))
+}
+
+/// SQLite has no `ADD COLUMN IF NOT EXISTS`; databases from older versions get the column here.
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<()> {
+    let exists: bool = conn.query_row(
+        &format!("SELECT EXISTS (SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1)"),
+        [column],
+        |r| r.get(0),
+    )?;
+    if !exists {
+        conn.execute_batch(&format!(
+            "ALTER TABLE {table} ADD COLUMN {column} {definition}"
+        ))?;
+    }
+    Ok(())
 }
 
 /// How local date-times are stored; this form sorts correctly as text.
@@ -241,8 +273,14 @@ impl Db {
                  kind   TEXT NOT NULL,
                  detail TEXT NOT NULL
              );
-             CREATE INDEX IF NOT EXISTS event_user_id ON event (user, id);",
+             CREATE INDEX IF NOT EXISTS event_user_id ON event (user, id);
+             CREATE TABLE IF NOT EXISTS account_settings (
+                 user    TEXT PRIMARY KEY,
+                 enforce INTEGER NOT NULL
+             );",
         )?;
+        add_column_if_missing(&conn, "event", "enforced", "INTEGER NOT NULL DEFAULT 0")?;
+        add_column_if_missing(&conn, "event", "host", "TEXT NOT NULL DEFAULT ''")?;
         Ok(Self { conn })
     }
 
@@ -646,12 +684,10 @@ impl Db {
         Ok(rows)
     }
 
-    /// What the rules say for the account at `now`.
-    pub fn decision(&self, user: &str, now: NaiveDateTime) -> Result<Decision> {
-        let weekday = now.date().weekday().num_days_from_monday() as u8;
-        let rule = self.day_rule(user, weekday)?;
+    /// Blackouts that apply to the account at `now`: its own, and the "all kids" ones if it has any rule.
+    pub fn blackout_spans(&self, user: &str, now: NaiveDateTime) -> Result<Vec<BlackoutSpan>> {
         let restricted = self.is_restricted(user)?;
-        let spans: Vec<BlackoutSpan> = self
+        Ok(self
             .blackouts(now)?
             .into_iter()
             .filter(|b| match &b.user {
@@ -663,7 +699,59 @@ impl Db {
                 end: b.end,
                 note: b.note,
             })
-            .collect();
+            .collect())
+    }
+
+    pub fn enforce(&self, user: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT enforce FROM account_settings WHERE user = ?1",
+                [user],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(false))
+    }
+
+    pub fn set_enforce(&mut self, user: &str, enforce: bool) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO account_settings (user, enforce) VALUES (?1, ?2)
+             ON CONFLICT (user) DO UPDATE SET enforce = excluded.enforce",
+            params![user, enforce],
+        )?;
+        Ok(())
+    }
+
+    pub fn app_ids_in(&self, category: CategoryId) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT app_id FROM app WHERE category_id = ?1 ORDER BY app_id")?;
+        let ids = stmt
+            .query_map([category], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        Ok(ids)
+    }
+
+    pub fn snapshot(&self, user: &str, now: NaiveDateTime) -> Result<protocol::AccountSnapshot> {
+        let weekday = now.date().weekday().num_days_from_monday() as u8;
+        Ok(protocol::AccountSnapshot {
+            user: user.to_string(),
+            enforce: self.enforce(user)?,
+            for_day: now.date(),
+            day: self.day_rule(user, weekday)?,
+            blackouts: self.blackout_spans(user, now)?,
+            used_secs: self.category_secs(user, now.date())?,
+            games: self.app_ids_in(GAMES)?,
+            ignored: self.app_ids_in(IGNORED)?,
+        })
+    }
+
+    /// What the rules say for the account at `now`.
+    pub fn decision(&self, user: &str, now: NaiveDateTime) -> Result<Decision> {
+        let weekday = now.date().weekday().num_days_from_monday() as u8;
+        let rule = self.day_rule(user, weekday)?;
+        let spans = self.blackout_spans(user, now)?;
         let used = self.category_secs(user, now.date())?;
         Ok(rules::decide(&rule, &spans, &used, now))
     }
@@ -671,7 +759,14 @@ impl Db {
     /// Remembers the decision if it differs from the account's last one. Returns whether that added
     /// an event to show: a new lock, a newly used-up category, or everything allowed again. Other
     /// changes are stored as rows that `events` leaves out.
-    pub fn log_decision(&mut self, user: &str, at: i64, decision: &Decision) -> Result<bool> {
+    pub fn log_decision(
+        &mut self,
+        user: &str,
+        at: i64,
+        decision: &Decision,
+        enforced: bool,
+        host: &str,
+    ) -> Result<bool> {
         let key = decision_key(decision);
         let last: String = self
             .conn
@@ -723,8 +818,9 @@ impl Db {
             }
         };
         self.conn.execute(
-            "INSERT INTO event (user, at, key, kind, detail) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![user, at, key, kind, detail],
+            "INSERT INTO event (user, at, key, kind, detail, enforced, host)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![user, at, key, kind, detail, enforced, host],
         )?;
         Ok(kind != STATE_KIND)
     }
@@ -732,7 +828,7 @@ impl Db {
     /// Newest first.
     pub fn events(&self, user: Option<&str>, limit: u32) -> Result<Vec<Event>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, user, at, kind, detail FROM event
+            "SELECT id, user, at, kind, detail, enforced, host FROM event
              WHERE (?1 IS NULL OR user = ?1) AND kind != ?3 ORDER BY id DESC LIMIT ?2",
         )?;
         let rows = stmt
@@ -743,6 +839,8 @@ impl Db {
                     at: r.get(2)?,
                     kind: r.get(3)?,
                     detail: r.get(4)?,
+                    enforced: r.get(5)?,
+                    host: r.get(6)?,
                 })
             })?
             .collect::<Result<_, _>>()?;
@@ -1489,13 +1587,34 @@ mod tests {
         let games_gone = decision_of(Computer::Allowed, &[GAMES]);
 
         // Nothing to say about an account that starts out allowed
-        assert!(!db.log_decision("kid1", 100, &allowed).unwrap());
-        assert!(db.log_decision("kid1", 110, &outside).unwrap());
-        assert!(!db.log_decision("kid1", 120, &outside).unwrap());
-        assert!(db.log_decision("kid1", 130, &blackout).unwrap());
-        assert!(db.log_decision("kid1", 140, &allowed).unwrap());
-        assert!(db.log_decision("kid1", 150, &games_gone).unwrap());
-        assert!(db.log_decision("kid2", 160, &outside).unwrap());
+        assert!(
+            !db.log_decision("kid1", 100, &allowed, false, "host-a")
+                .unwrap()
+        );
+        assert!(
+            db.log_decision("kid1", 110, &outside, false, "host-a")
+                .unwrap()
+        );
+        assert!(
+            !db.log_decision("kid1", 120, &outside, false, "host-a")
+                .unwrap()
+        );
+        assert!(
+            db.log_decision("kid1", 130, &blackout, false, "host-a")
+                .unwrap()
+        );
+        assert!(
+            db.log_decision("kid1", 140, &allowed, false, "host-a")
+                .unwrap()
+        );
+        assert!(
+            db.log_decision("kid1", 150, &games_gone, false, "host-a")
+                .unwrap()
+        );
+        assert!(
+            db.log_decision("kid2", 160, &outside, false, "host-a")
+                .unwrap()
+        );
 
         let all = db.events(None, 50).unwrap();
         assert_eq!(all.len(), 5);
@@ -1539,12 +1658,20 @@ mod tests {
             "kid1",
             100,
             &decision_of(Computer::OutsideSchedule, &[GAMES]),
+            false,
+            "host-a",
         )
         .unwrap();
         // Midnight: the budget is fresh, but the computer is still outside its hours
         assert!(
-            !db.log_decision("kid1", 110, &decision_of(Computer::OutsideSchedule, &[]))
-                .unwrap()
+            !db.log_decision(
+                "kid1",
+                110,
+                &decision_of(Computer::OutsideSchedule, &[]),
+                false,
+                "host-a"
+            )
+            .unwrap()
         );
         assert_eq!(kinds(&db), [pair("locked", "outside schedule")]);
         // The change was still remembered: the same decision again adds no row
@@ -1554,8 +1681,14 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(rows(&db), 2);
-        db.log_decision("kid1", 120, &decision_of(Computer::OutsideSchedule, &[]))
-            .unwrap();
+        db.log_decision(
+            "kid1",
+            120,
+            &decision_of(Computer::OutsideSchedule, &[]),
+            false,
+            "host-a",
+        )
+        .unwrap();
         assert_eq!(rows(&db), 2);
         std::fs::remove_file(&path).unwrap();
     }
@@ -1567,11 +1700,19 @@ mod tests {
             "kid1",
             100,
             &decision_of(Computer::OutsideSchedule, &[GAMES]),
+            false,
+            "host-a",
         )
         .unwrap();
         assert!(
-            !db.log_decision("kid1", 110, &decision_of(Computer::Allowed, &[GAMES]))
-                .unwrap()
+            !db.log_decision(
+                "kid1",
+                110,
+                &decision_of(Computer::Allowed, &[GAMES]),
+                false,
+                "host-a"
+            )
+            .unwrap()
         );
         // Games were already used up before, so there is nothing new to close either
         assert_eq!(kinds(&db), [pair("locked", "outside schedule")]);
@@ -1585,11 +1726,19 @@ mod tests {
             "kid1",
             100,
             &decision_of(Computer::OutsideSchedule, &[GAMES]),
+            false,
+            "host-a",
         )
         .unwrap();
         assert!(
-            db.log_decision("kid1", 110, &decision_of(Computer::Allowed, &[]))
-                .unwrap()
+            db.log_decision(
+                "kid1",
+                110,
+                &decision_of(Computer::Allowed, &[]),
+                false,
+                "host-a"
+            )
+            .unwrap()
         );
         assert_eq!(
             kinds(&db),
@@ -1601,11 +1750,23 @@ mod tests {
     #[test]
     fn unlocking_into_a_newly_used_up_category_is_logged_as_closed() {
         let (mut db, path) = temp_db("events-unlock-closed");
-        db.log_decision("kid1", 100, &decision_of(Computer::OutsideSchedule, &[]))
-            .unwrap();
+        db.log_decision(
+            "kid1",
+            100,
+            &decision_of(Computer::OutsideSchedule, &[]),
+            false,
+            "host-a",
+        )
+        .unwrap();
         assert!(
-            db.log_decision("kid1", 110, &decision_of(Computer::Allowed, &[GAMES]))
-                .unwrap()
+            db.log_decision(
+                "kid1",
+                110,
+                &decision_of(Computer::Allowed, &[GAMES]),
+                false,
+                "host-a"
+            )
+            .unwrap()
         );
         assert_eq!(
             kinds(&db),
@@ -1620,10 +1781,22 @@ mod tests {
         db.conn
             .execute("INSERT INTO category (id, name) VALUES (3, 'Videos')", [])
             .unwrap();
-        db.log_decision("kid1", 100, &decision_of(Computer::Allowed, &[GAMES]))
-            .unwrap();
-        db.log_decision("kid1", 110, &decision_of(Computer::Allowed, &[GAMES, 3]))
-            .unwrap();
+        db.log_decision(
+            "kid1",
+            100,
+            &decision_of(Computer::Allowed, &[GAMES]),
+            false,
+            "host-a",
+        )
+        .unwrap();
+        db.log_decision(
+            "kid1",
+            110,
+            &decision_of(Computer::Allowed, &[GAMES, 3]),
+            false,
+            "host-a",
+        )
+        .unwrap();
         assert_eq!(
             kinds(&db),
             [pair("closed", "Games"), pair("closed", "Videos")]
@@ -1634,11 +1807,23 @@ mod tests {
     #[test]
     fn a_used_up_category_cleared_is_logged_as_allowed() {
         let (mut db, path) = temp_db("events-cleared");
-        db.log_decision("kid1", 100, &decision_of(Computer::Allowed, &[GAMES]))
-            .unwrap();
+        db.log_decision(
+            "kid1",
+            100,
+            &decision_of(Computer::Allowed, &[GAMES]),
+            false,
+            "host-a",
+        )
+        .unwrap();
         assert!(
-            db.log_decision("kid1", 110, &decision_of(Computer::Allowed, &[]))
-                .unwrap()
+            db.log_decision(
+                "kid1",
+                110,
+                &decision_of(Computer::Allowed, &[]),
+                false,
+                "host-a"
+            )
+            .unwrap()
         );
         assert_eq!(kinds(&db), [pair("closed", "Games"), pair("allowed", "")]);
         std::fs::remove_file(&path).unwrap();
@@ -1747,10 +1932,22 @@ mod tests {
             &[("steam:1", "Minecraft")],
         ))
         .unwrap();
-        db.log_decision("kid1", old, &decision_of(Computer::OutsideSchedule, &[]))
-            .unwrap();
-        db.log_decision("kid1", now, &decision_of(Computer::Allowed, &[]))
-            .unwrap();
+        db.log_decision(
+            "kid1",
+            old,
+            &decision_of(Computer::OutsideSchedule, &[]),
+            false,
+            "host-a",
+        )
+        .unwrap();
+        db.log_decision(
+            "kid1",
+            now,
+            &decision_of(Computer::Allowed, &[]),
+            false,
+            "host-a",
+        )
+        .unwrap();
 
         db.prune(now).unwrap();
         let count = |table: &str| -> i64 {
@@ -1763,6 +1960,118 @@ mod tests {
         // Totals don't depend on the pruned tables
         // Two days, each with a host total and one app
         assert_eq!(count("usage"), 4);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn overrun_and_errors_are_clipped_and_limited() {
+        let long = "é".repeat(1000);
+        let many: Vec<String> = (0..60).map(|i| format!("entry-{i:02}")).collect();
+        let mut report = sample_report("host-a", 1, start_of_test() + 15, UserState::Active, &[]);
+        report.samples[0].users[0].overrun = vec![long.clone()];
+        report.samples[0].users[0].errors = many;
+        let (mut db, path) = temp_db("overrun-clip");
+        let recorded = db.record(&report).unwrap();
+        let user = &recorded.samples[0].users[0];
+        assert_eq!(user.overrun, ["é".repeat(200)]);
+        assert_eq!(user.errors.len(), 50);
+        assert_eq!(user.errors[49], "entry-49");
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn enforce_defaults_off_and_round_trips() {
+        let (mut db, path) = temp_db("enforce");
+        assert!(!db.enforce("kid1").unwrap());
+        db.set_enforce("kid1", true).unwrap();
+        assert!(db.enforce("kid1").unwrap());
+        db.set_enforce("kid1", false).unwrap();
+        assert!(!db.enforce("kid1").unwrap());
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn snapshot_carries_todays_rule_usage_blackouts_and_app_lists() {
+        let (mut db, path) = temp_db("snapshot");
+        let t0 = start_of_test();
+        db.record(&sample_report(
+            "host-a",
+            1,
+            t0 + 15,
+            UserState::Active,
+            &[("steam:1", "Minecraft"), ("kitty", "kitty")],
+        ))
+        .unwrap();
+        db.set_app_category("kitty", Some(IGNORED)).unwrap();
+        let rule = DayRule {
+            restricted: true,
+            stretches: vec![Stretch {
+                start_min: 375,
+                end_min: 1260,
+            }],
+            budgets: BTreeMap::from([(GAMES, 60)]),
+        };
+        db.set_day_rule("kid1", weekday_today(), &rule).unwrap();
+        let now = noon_today();
+        let hour = chrono::Duration::hours(1);
+        db.add_blackout(Some("kid1"), now + hour, now + hour * 2, "dinner")
+            .unwrap();
+        db.add_blackout(Some("kid2"), now + hour, now + hour * 2, "not mine")
+            .unwrap();
+        db.set_enforce("kid1", true).unwrap();
+
+        let snap = db.snapshot("kid1", now).unwrap();
+        assert!(snap.enforce);
+        assert_eq!(snap.for_day, now.date());
+        assert_eq!(snap.day, rule);
+        assert_eq!(snap.used_secs[&GAMES], 15);
+        assert_eq!(
+            snap.blackouts
+                .iter()
+                .map(|b| b.note.as_str())
+                .collect::<Vec<_>>(),
+            ["dinner"]
+        );
+        assert_eq!(snap.games, ["steam:1"]);
+        assert_eq!(snap.ignored, ["kitty"]);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn events_record_enforcement_and_host() {
+        let (mut db, path) = temp_db("event-fields");
+        db.log_decision(
+            "kid1",
+            100,
+            &decision_of(Computer::OutsideSchedule, &[]),
+            true,
+            "host-a",
+        )
+        .unwrap();
+        let e = &db.events(Some("kid1"), 10).unwrap()[0];
+        assert!(e.enforced);
+        assert_eq!(e.host, "host-a");
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn event_columns_are_added_to_an_existing_database() {
+        let path =
+            std::env::temp_dir().join(format!("kidtime-test-oldevents-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE event (id INTEGER PRIMARY KEY, user TEXT NOT NULL, at INTEGER NOT NULL,
+                 key TEXT NOT NULL, kind TEXT NOT NULL, detail TEXT NOT NULL);
+                 INSERT INTO event (user, at, key, kind, detail) VALUES ('kid1', 1, 'k', 'locked', 'x');",
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        let e = &db.events(Some("kid1"), 10).unwrap()[0];
+        assert!(!e.enforced);
+        assert_eq!(e.host, "");
         std::fs::remove_file(&path).unwrap();
     }
 }

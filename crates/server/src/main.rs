@@ -128,6 +128,7 @@ pub(crate) fn router(state: Arc<AppState>) -> Router {
     let behind_login = Router::new()
         .route("/api/status", get(status))
         .route("/api/rules/{user}", get(api::get_rules))
+        .route("/api/accounts/{user}/enforce", put(api::put_enforce))
         .route("/api/rules/{user}/copy", post(api::copy_rule))
         .route("/api/rules/{user}/copy-to", post(api::copy_week))
         .route("/api/rules/{user}/{weekday}", put(api::put_rule))
@@ -227,7 +228,8 @@ async fn report(
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
-    {
+    let now_local = Local::now().naive_local();
+    let accounts = {
         let mut db = state.db.lock().unwrap();
         // From here on only the report as recorded is used, with its names clipped
         report = match db.record(&report) {
@@ -237,28 +239,50 @@ async fn report(
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
         };
-        let now_local = Local::now().naive_local();
         // Agents report every tracked account in every sample. Only the ones at a computer right
         // now have anything to lock or close.
-        let mut users: Vec<&str> = report
+        let mut at_computer: Vec<&str> = report
             .samples
             .last()
             .into_iter()
             .flat_map(|s| s.users.iter().filter(|u| u.state.counts()))
             .map(|u| u.user.as_str())
             .collect();
-        users.sort_unstable();
-        users.dedup();
-        for user in users {
+        at_computer.sort_unstable();
+        at_computer.dedup();
+        for user in at_computer {
             // A failure here must not make the agent resend a report that was already recorded
-            let logged = db
-                .decision(user, now_local)
-                .and_then(|d| db.log_decision(user, now(), &d));
+            let logged = db.enforce(user).and_then(|enforced| {
+                let decision = db.decision(user, now_local)?;
+                db.log_decision(user, now(), &decision, enforced, &report.host)
+            });
             if let Err(e) = logged {
                 tracing::error!("logging the decision for {user}: {e:#}");
             }
         }
-    }
+
+        // The answer covers every account in the last sample, in that order
+        let mut answered: Vec<&str> = Vec::new();
+        let mut accounts = Vec::new();
+        for user in report
+            .samples
+            .last()
+            .into_iter()
+            .flat_map(|s| s.users.iter())
+            .map(|u| u.user.as_str())
+        {
+            if answered.contains(&user) {
+                continue;
+            }
+            answered.push(user);
+            match db.snapshot(user, now_local) {
+                Ok(snapshot) => accounts.push(snapshot),
+                // The report is already recorded; answer with what can be built rather than fail it
+                Err(e) => tracing::error!("snapshot for {user}: {e:#}"),
+            }
+        }
+        accounts
+    };
     if let Some(latest) = report.samples.last() {
         state.live.lock().unwrap().insert(
             report.host.clone(),
@@ -269,7 +293,14 @@ async fn report(
             },
         );
     }
-    StatusCode::NO_CONTENT.into_response()
+    (
+        StatusCode::OK,
+        Json(protocol::ReportResponse {
+            server_time: now_local,
+            accounts,
+        }),
+    )
+        .into_response()
 }
 
 #[derive(Serialize)]
@@ -296,6 +327,12 @@ struct UserStatus {
     restricted: bool,
     /// None if it couldn't be worked out; the other accounts are still returned.
     decision: Option<protocol::rules::Decision>,
+    /// Whether agents act on this account's decisions.
+    enforce: bool,
+    /// Apps an agent couldn't close within its grace period, from the hosts reporting now.
+    overrun: Vec<String>,
+    /// Problems agents hit carrying out decisions, from the hosts reporting now.
+    errors: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -336,9 +373,21 @@ async fn status(State(state): State<Arc<AppState>>) -> Result<Json<Status>, Stat
 
     // Live sessions per user, ignoring hosts that have gone quiet, and leaving out ignored apps
     let mut sessions: HashMap<String, Vec<HostSession>> = HashMap::new();
+    let mut overrun: HashMap<String, Vec<String>> = HashMap::new();
+    let mut errors: HashMap<String, Vec<String>> = HashMap::new();
     for (host, live) in state.live.lock().unwrap().iter() {
         let stale = now - live.received_at > i64::from(live.interval_secs) * 3;
         for u in &live.users {
+            if !stale {
+                overrun
+                    .entry(u.user.clone())
+                    .or_default()
+                    .extend(u.overrun.iter().cloned());
+                errors
+                    .entry(u.user.clone())
+                    .or_default()
+                    .extend(u.errors.iter().cloned());
+            }
             let (state, apps) = if stale {
                 (UserState::Offline, Vec::new())
             } else {
@@ -397,10 +446,21 @@ async fn status(State(state): State<Arc<AppState>>) -> Result<Json<Status>, Stat
             .inspect_err(|e| tracing::error!("decision for {name}: {e:#}"))
             .ok();
         let restricted = db.is_restricted(&name).map_err(internal)?;
+        let enforce = db.enforce(&name).map_err(internal)?;
+        let sorted = |mut list: Vec<String>| {
+            list.sort();
+            list.dedup();
+            list
+        };
+        let overrun = sorted(overrun.remove(&name).unwrap_or_default());
+        let errors = sorted(errors.remove(&name).unwrap_or_default());
 
         users.push(UserStatus {
             restricted,
             decision,
+            enforce,
+            overrun,
+            errors,
             state,
             host,
             today_secs: days.last().map_or(0, |d| d.secs),
