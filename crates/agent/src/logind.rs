@@ -96,7 +96,6 @@ impl Logind {
     }
 
     /// The user's graphical sessions on this PC, and whether each is locked.
-    #[allow(dead_code)] // Task 7 wires this into the enforcement loop
     pub async fn graphical_sessions(
         &self,
         uid: u32,

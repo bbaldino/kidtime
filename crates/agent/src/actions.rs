@@ -215,7 +215,6 @@ pub struct SystemActions {
 }
 
 impl SystemActions {
-    #[allow(dead_code)] // used from main in the next task
     pub fn new(
         users: HashMap<String, (u32, PathBuf)>,
         streaming_sway_socket: Option<String>,

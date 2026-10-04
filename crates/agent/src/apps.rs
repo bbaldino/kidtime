@@ -22,7 +22,6 @@ pub struct UserApps {
     /// client and the games it launched.
     pub streamed_apps: Vec<App>,
     /// Every app in `apps` and `streamed_apps`, with its processes.
-    #[allow(dead_code)] // Task 7 wires this into the enforcement loop
     pub running: Vec<RunningApp>,
 }
 

@@ -19,10 +19,8 @@ pub struct Window {
     /// Wayland app_id, or the X11 class for Xwayland windows.
     pub class: String,
     pub title: String,
-    #[allow(dead_code)] // Task 7 uses this to name the focused window's process
     pub pid: u32,
     /// Sway's container id, for closing this one window.
-    #[allow(dead_code)] // Task 7 uses this to close the focused window
     pub con_id: i64,
 }
 

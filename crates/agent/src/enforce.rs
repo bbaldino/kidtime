@@ -1,6 +1,5 @@
 //! Turns the server's rules into actions on this PC. Pure logic: every effect goes through `Actions`, so the
 //! whole thing is tested with a fake.
-#![allow(dead_code)]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;

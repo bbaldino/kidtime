@@ -12,6 +12,10 @@ NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=read-only
 PrivateTmp=yes
+# State survives restarts; /etc is written by usermod and the login-screen banner settings
+StateDirectory=kidtime
+StateDirectoryMode=0700
+ReadWritePaths=/etc /var/lib/kidtime
 
 [Install]
 WantedBy=multi-user.target
