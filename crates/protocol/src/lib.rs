@@ -2,6 +2,9 @@
 
 pub mod rules;
 
+use std::collections::BTreeMap;
+
+use chrono::{NaiveDate, NaiveDateTime};
 use serde::{Deserialize, Serialize};
 
 /// A batch of samples sent from one agent to the server.
@@ -36,6 +39,39 @@ pub struct UserSample {
     /// Apps attributed to the user at this tick: everything running in their
     /// desktop session, or just the streamed games when `state` is `Streaming`.
     pub apps: Vec<App>,
+    /// Uncategorised apps still running after the games budget ran out (they count, but aren't closed).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub overrun: Vec<String>,
+    /// Enforcement actions that failed since the last report.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<String>,
+}
+
+/// What the server answers a report with: everything an agent needs to enforce the rules for the accounts
+/// in that report, including while the server is unreachable afterwards.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReportResponse {
+    /// The server's local wall-clock time, so an agent can tell if its own clock is off.
+    pub server_time: NaiveDateTime,
+    pub accounts: Vec<AccountSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AccountSnapshot {
+    pub user: String,
+    /// Off: the agent leaves the account alone and undoes anything it did.
+    pub enforce: bool,
+    /// The day `day` and `used_secs` belong to.
+    pub for_day: NaiveDate,
+    pub day: rules::DayRule,
+    /// Blackouts that apply to this account and haven't ended.
+    pub blackouts: Vec<rules::BlackoutSpan>,
+    /// Today's category time across all PCs, merged.
+    pub used_secs: BTreeMap<rules::CategoryId, i64>,
+    /// App ids in the Games category: the only apps an agent closes.
+    pub games: Vec<String>,
+    /// App ids in the Ignored category: never counted.
+    pub ignored: Vec<String>,
 }
 
 impl UserState {
@@ -70,4 +106,42 @@ pub struct App {
     pub id: String,
     /// Human-readable name for the dashboard.
     pub name: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn snapshot_round_trips_and_old_samples_still_parse() {
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 10, 5).unwrap();
+        let response = ReportResponse {
+            server_time: day.and_hms_opt(12, 0, 0).unwrap(),
+            accounts: vec![AccountSnapshot {
+                user: "kid1".into(),
+                enforce: true,
+                for_day: day,
+                day: rules::DayRule::default(),
+                blackouts: vec![rules::BlackoutSpan {
+                    start: day.and_hms_opt(17, 0, 0).unwrap(),
+                    end: day.and_hms_opt(19, 0, 0).unwrap(),
+                    note: "dinner".into(),
+                }],
+                used_secs: BTreeMap::from([(rules::GAMES, 900)]),
+                games: vec!["steam:1".into()],
+                ignored: vec!["kitty".into()],
+            }],
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert_eq!(
+            serde_json::from_str::<ReportResponse>(&json).unwrap(),
+            response
+        );
+
+        // A sample from an agent that predates overrun/errors
+        let old = r#"{"user":"kid1","state":"active","apps":[]}"#;
+        let sample: UserSample = serde_json::from_str(old).unwrap();
+        assert!(sample.overrun.is_empty() && sample.errors.is_empty());
+    }
 }

@@ -230,6 +230,8 @@ async fn take_sample(
             _ => (state, found.apps),
         };
         samples.push(UserSample {
+            overrun: Vec::new(),
+            errors: Vec::new(),
             user: user.name.clone(),
             state,
             apps,

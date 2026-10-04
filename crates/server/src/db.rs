@@ -83,6 +83,8 @@ fn sanitised(report: &Report) -> Report {
                     .users
                     .iter()
                     .map(|user| UserSample {
+                        overrun: Vec::new(),
+                        errors: Vec::new(),
                         user: clip(&user.user),
                         state: user.state,
                         apps: user
@@ -850,6 +852,8 @@ mod tests {
                     at: t0 + 15 * seq as i64,
                     elapsed_secs: 15,
                     users: vec![UserSample {
+                        overrun: Vec::new(),
+                        errors: Vec::new(),
                         user: "kid1".into(),
                         state,
                         apps: vec![App {
@@ -955,6 +959,8 @@ mod tests {
                 at,
                 elapsed_secs: 15,
                 users: vec![UserSample {
+                    overrun: Vec::new(),
+                    errors: Vec::new(),
                     user: "kid1".into(),
                     state,
                     apps: apps

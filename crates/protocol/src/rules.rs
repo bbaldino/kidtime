@@ -33,7 +33,7 @@ pub struct DayRule {
 }
 
 /// A one-off blackout that applies to the account being decided, in local time.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlackoutSpan {
     pub start: NaiveDateTime,
     pub end: NaiveDateTime,
