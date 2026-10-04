@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.5.0](https://github.com/bbaldino/kidtime/compare/v0.4.0...v0.5.0) (2026-10-04)
+
+
+### Features
+
+* **agent:** add the enforcement logic ([49353ff](https://github.com/bbaldino/kidtime/commit/49353ff2dec320ca2a0f6e563b9eecc9171215a9))
+* **agent:** carry out enforcement on the system ([1c2b85e](https://github.com/bbaldino/kidtime/commit/1c2b85e9372dc56a6ccf1d27ae0febf01e33f6e8))
+* **agent:** enforce the rules every 5 seconds and keep state across restarts ([614ba5b](https://github.com/bbaldino/kidtime/commit/614ba5be26e0322c6618250adcf74334f4e260b1))
+* **agent:** find running apps' processes and sessions' lock state ([ff54d44](https://github.com/bbaldino/kidtime/commit/ff54d44f349a70035f941911c0d1411c669d57f0))
+* **dashboard:** add the Enforce switch and show what enforcement did ([8c4eb43](https://github.com/bbaldino/kidtime/commit/8c4eb43e587a081a39c40c4f3feda1a711f9e6e5))
+* **protocol:** add the report response snapshot and report extras ([dcd43d1](https://github.com/bbaldino/kidtime/commit/dcd43d1ed96fd2d7b56833175437484a0688d71b))
+* **server:** answer reports with per-account snapshots and add the Enforce switch ([8bb7ef2](https://github.com/bbaldino/kidtime/commit/8bb7ef248c7f64520a361bb8b3ae674876700b2b))
+
+
+### Bug Fixes
+
+* **agent:** escalate to SIGKILL however far apart close calls are ([1d338ee](https://github.com/bbaldino/kidtime/commit/1d338eef77c9793939fe655e4b15bc83026fe416))
+* **agent:** harden enforcement against crashes, hangs and the child ([86e1161](https://github.com/bbaldino/kidtime/commit/86e1161e1675e81a4fc78fba9d6fd819af70b627))
+* **agent:** keep blocks across reboots and stops, and report failed releases ([5b9d8c2](https://github.com/bbaldino/kidtime/commit/5b9d8c2349d32f79e3157821ebcfe4b8bad1c5b5))
+* **agent:** make enforcement commands safe against odd input and passwordless accounts ([7fcb009](https://github.com/bbaldino/kidtime/commit/7fcb009fb39159a1cb2de7d7327f16ecf6ed3ecf))
+* **agent:** never block on the stream socket, and report unlocks only when seen ([bba975d](https://github.com/bbaldino/kidtime/commit/bba975d6e672e583e0e85f338eb8211b07488266))
+* carry the week of rules in the snapshot so blocks hold past midnight ([8e3efeb](https://github.com/bbaldino/kidtime/commit/8e3efeb3661f8c6398769aef4ce086fd4b8894b9))
+* **dashboard:** disable the Enforce switch while its change is saving ([e41f206](https://github.com/bbaldino/kidtime/commit/e41f206ec4e9d5cc139790f915d7721388063586))
+* **deploy:** make banner setup failures take the fallback, and clean up on uninstall ([5fcb41f](https://github.com/bbaldino/kidtime/commit/5fcb41ffd83f792178a60b4478b7bde3420ce9df))
+* make uninstall keep the lock record unless everything was released ([457a4fd](https://github.com/bbaldino/kidtime/commit/457a4fdde1ae86414e1ab73ff78eb367ee3d156c))
+
 ## [0.4.0](https://github.com/bbaldino/kidtime/compare/v0.3.0...v0.4.0) (2026-10-03)
 
 
