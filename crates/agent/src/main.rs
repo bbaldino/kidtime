@@ -2,6 +2,7 @@
 //! running, and reports it to the kidtime server.
 
 mod apps;
+mod enforce;
 mod logind;
 mod sunshine;
 mod sway;
