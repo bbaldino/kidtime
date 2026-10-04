@@ -187,7 +187,8 @@ GDM settings file, the state file). The unit gains `StateDirectory=kidtime`. nft
 - Installs the new unit (state directory, write paths).
 - `--stop-timekpr`: stops and disables timekpr's service on that PC.
 - Writes the GDM profile override so later login screens read kidtime's banner settings.
-- `--uninstall`: runs `kidtime-agent --release-all`, then removes the unit, binary and config.
+- `--uninstall`: stops the agent first, runs `kidtime-agent --release-all`, then removes the unit, binary, config
+  and state; it removes nothing if the release fails or the agent won't stop.
 
 ## Error handling
 

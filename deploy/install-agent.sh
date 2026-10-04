@@ -63,33 +63,47 @@ fi
 
 if [ "$uninstall" = yes ]; then
   bin=$ROOT/usr/local/bin/kidtime-agent
+  state=$ROOT/var/lib/kidtime/agent-state.json
+  recovery() {
+    cat >&2 <<'MSG'
+To recover by hand (stop the agent first, or it undoes these within seconds):
+  sudo systemctl disable --now kidtime-agent
+  sudo usermod -U <kid>             # for each kid whose login is disabled
+  sudo nft delete table inet kidtime
+  sudo rm -f /etc/dconf/db/gdm.d/90-kidtime && sudo dconf update   # the login-screen banner
+MSG
+  }
   if [ -n "$ROOT" ]; then
     echo "would run: systemctl stop kidtime-agent.service (so it can't re-apply blocks)"
+    echo "would run: systemctl is-active --quiet kidtime-agent.service; if still active: fail, release and remove nothing"
   else
     echo "== stopping the agent"
     systemctl stop kidtime-agent.service 2>/dev/null || true
+    if systemctl is-active --quiet kidtime-agent.service; then
+      fail "the agent is still running; stop it and run --uninstall again"
+    fi
   fi
   if [ -e "$bin" ]; then
     if [ -n "$ROOT" ]; then
-      echo "would run: $bin --config $CONFIG --release-all"
+      echo "would run: $bin --config $CONFIG --release-all (on failure: print recovery steps, remove nothing)"
     else
       echo "== releasing everything the agent enforced"
       if ! out=$("$bin" --config "$CONFIG" --release-all 2>&1); then
         echo "$out" >&2
-        cat >&2 <<'MSG'
-
-error: the agent could not undo everything. Nothing was removed, so this can be retried.
-To recover by hand:
-  sudo usermod -U <kid>             # for each kid whose login is disabled
-  sudo nft delete table inet kidtime
-  (the login-screen banner: delete /etc/dconf/db/gdm.d/90-kidtime, then run: sudo dconf update)
-MSG
+        echo >&2
+        echo "error: the agent could not undo everything. Nothing was removed, so this can be retried." >&2
+        recovery
         exit 1
       fi
       [ -z "$out" ] || echo "$out"
     fi
+  elif [ -e "$state" ]; then
+    echo "error: $state exists but there is no agent binary at $bin to release it." >&2
+    echo "Nothing was removed, because that file records which accounts are locked out." >&2
+    recovery
+    exit 1
   else
-    echo "no agent binary at $bin; skipping --release-all"
+    echo "no agent binary at $bin and no state file; skipping --release-all"
   fi
   if [ -n "$ROOT" ]; then
     echo "would run: systemctl disable --now kidtime-agent.service"
@@ -163,11 +177,23 @@ install -D -m 644 "$REPO/deploy/kidtime-agent.service" "$ROOT/etc/systemd/system
 echo "installed /usr/local/bin/kidtime-agent and the systemd unit"
 
 # Later login screens should read kidtime's banner settings (the agent writes them into gdm.d).
+# The banner is optional: a failure here must not abort the install.
 if [ -z "$ROOT" ] && [ -e /usr/share/dconf/profile/gdm ] && [ ! -e /etc/dconf/profile/gdm ]; then
-  install -d /etc/dconf/profile /etc/dconf/db/gdm.d
-  { echo "user-db:user"; echo "system-db:gdm"; grep -v '^user-db:' /usr/share/dconf/profile/gdm; } > /etc/dconf/profile/gdm
-  dconf update
-  echo "enabled login-screen banner settings (/etc/dconf/profile/gdm)"
+  if (
+    set -e
+    tmp=$(mktemp /etc/dconf/profile.gdm.XXXXXX 2>/dev/null || mktemp)
+    trap 'rm -f "$tmp"' EXIT
+    install -d /etc/dconf/profile /etc/dconf/db/gdm.d
+    { echo "user-db:user"; echo "system-db:gdm"; grep -v '^user-db:' /usr/share/dconf/profile/gdm || true; } > "$tmp"
+    chmod 644 "$tmp"
+    mv "$tmp" /etc/dconf/profile/gdm
+    dconf update
+  ); then
+    echo "enabled login-screen banner settings (/etc/dconf/profile/gdm)"
+  else
+    rm -f /etc/dconf/profile/gdm
+    echo "warning: could not enable the login-screen banner settings; continuing without them" >&2
+  fi
 fi
 
 [ -z "$ROOT" ] || exit 0

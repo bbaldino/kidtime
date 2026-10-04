@@ -99,7 +99,8 @@ The script asks for the agent token, checks the server and the token, writes
 `/etc/kidtime/agent.toml` (mode 600), installs the binary and the systemd unit, and
 shows what the agent sees. Add `--streaming` on a machine that hosts Sunshine
 streaming sessions, and `--host NAME` if the machine's hostname is unset. Run it again
-with no options to upgrade the binary. `--stop-timekpr` and `--uninstall` are described under "Enforcement". See `deploy/agent.toml.example` for all settings.
+with no options to upgrade the binary. `--stop-timekpr` and `--uninstall` are described under "Enforcement".
+See `deploy/agent.toml.example` for all settings.
 
 If the server can't be reached, the agent queues up to a day of samples and sends them later.
 
@@ -156,17 +157,22 @@ The dashboard shows what enforcement did, and any action that failed (it is retr
 
 **Retiring timekpr:** once you trust kidtime, run `sudo deploy/install-agent.sh --stop-timekpr` on each PC.
 
-**Recovery.** If the agent stops for good while a kid is blocked, or something goes wrong:
+**Recovery.** If the agent is broken, or you need a kid unlocked right now. If the server is reachable, the
+quickest way is to switch Enforce off for that kid on the Today tab and wait 15 seconds: everything is released
+and the agent keeps running. Otherwise stop the agent first. While it runs, it undoes a manual `usermod -U`
+within seconds, and after a reboot it starts again and re-blocks from its saved rules.
 
 ```sh
+sudo systemctl disable --now kidtime-agent
 sudo /usr/local/bin/kidtime-agent --config /etc/kidtime/agent.toml --release-all   # undo everything it recorded
 sudo usermod -U <kid>                  # re-enable a login by hand
 sudo nft delete table inet kidtime     # remove the stream block by hand
+sudo rm -f /etc/dconf/db/gdm.d/90-kidtime && sudo dconf update   # clear the login-screen banner
 ```
 
 `--release-all` exits non-zero if anything remains. `sudo deploy/install-agent.sh --uninstall` stops the
-agent, runs `--release-all`, and only if that succeeds removes the unit, binary, config and state.
-Turning Enforce off for a kid also releases everything within one report cycle.
+agent, runs `--release-all`, and removes the unit, binary, config and state only if that succeeds. It removes
+nothing if the agent won't stop, or if the state file exists but the binary is gone.
 
 ## Who can see and change things
 
