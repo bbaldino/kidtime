@@ -28,8 +28,13 @@ pub struct Window {
     pub con_id: i64,
 }
 
-/// The focused window, if Sway is reachable and a titled window has focus.
-pub fn focused_window(socket: &Path) -> Option<Window> {
+/// The focused window, if Sway is reachable and a titled window has focus. `uid` is the account whose Sway
+/// it is: the socket must be a socket owned by that account.
+pub fn focused_window(socket: &Path, uid: u32) -> Option<Window> {
+    if let Err(e) = check_socket(socket, uid) {
+        tracing::debug!("sway {}: {e}", socket.display());
+        return None;
+    }
     let tree = get_tree(socket, DEADLINE)
         .map_err(|e| tracing::debug!("sway {}: {e}", socket.display()))
         .ok()?;
@@ -61,9 +66,63 @@ pub fn app_for(window: &Window, steam_name: impl FnOnce(u32) -> String) -> App {
     }
 }
 
+/// The path is in a directory the kid owns: it must be a socket (not followed if a symlink) owned by them.
+fn check_socket(path: &Path, uid: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let meta = std::fs::symlink_metadata(path)?;
+    if !meta.file_type().is_socket() {
+        return Err(std::io::Error::other("not a socket"));
+    }
+    if meta.uid() != uid {
+        return Err(std::io::Error::other(format!(
+            "owned by uid {}, not {uid}",
+            meta.uid()
+        )));
+    }
+    Ok(())
+}
+
+/// Connects without ever blocking: a listener that never accepts fills its backlog, and a blocking connect
+/// would then wait forever. A full backlog (EAGAIN) is an error; a connect still in progress gets at most
+/// the time left before `end`.
+fn connect_by(socket: &Path, end: Instant) -> std::io::Result<UnixStream> {
+    use socket2::{Domain, SockAddr, Socket, Type};
+    use std::os::fd::{AsRawFd, OwnedFd};
+    let sock = Socket::new(Domain::UNIX, Type::STREAM, None)?;
+    sock.set_nonblocking(true)?;
+    match sock.connect(&SockAddr::unix(socket)?) {
+        Ok(()) => {}
+        Err(e) if e.raw_os_error() == Some(libc::EINPROGRESS) => {
+            let mut pfd = libc::pollfd {
+                fd: sock.as_raw_fd(),
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            let ms = remaining(end)?.as_millis().min(i32::MAX as u128) as libc::c_int;
+            // SAFETY: one valid pollfd, and the count says one
+            let ready = unsafe { libc::poll(&mut pfd, 1, ms) };
+            if ready < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if ready == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "sway took too long to accept",
+                ));
+            }
+            if let Some(e) = sock.take_error()? {
+                return Err(e);
+            }
+        }
+        Err(e) => return Err(e),
+    }
+    sock.set_nonblocking(false)?;
+    Ok(UnixStream::from(OwnedFd::from(sock)))
+}
+
 fn get_tree(socket: &Path, deadline: Duration) -> std::io::Result<Value> {
     let end = Instant::now() + deadline;
-    let mut stream = UnixStream::connect(socket)?;
+    let mut stream = connect_by(socket, end)?;
     let mut request = MAGIC.to_vec();
     request.extend_from_slice(&0u32.to_le_bytes());
     request.extend_from_slice(&GET_TREE.to_le_bytes());
@@ -171,6 +230,61 @@ mod tests {
         m.extend_from_slice(&GET_TREE.to_le_bytes());
         m.extend_from_slice(body);
         m
+    }
+
+    use std::sync::mpsc;
+
+    fn my_uid() -> u32 {
+        // SAFETY: getuid has no preconditions
+        unsafe { libc::getuid() }
+    }
+
+    #[test]
+    fn a_listener_that_never_accepts_doesnt_block_the_connect() {
+        use socket2::{Domain, SockAddr, Socket, Type};
+        let dir = std::path::PathBuf::from("/tmp/claude-1000/kidtime-sdd");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("full-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = Socket::new(Domain::UNIX, Type::STREAM, None).unwrap();
+        listener.bind(&SockAddr::unix(&path).unwrap()).unwrap();
+        listener.listen(0).unwrap();
+        // One pending connection fills a backlog of 0; nobody ever accepts
+        let pending = UnixStream::connect(&path).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let p = path.clone();
+        std::thread::spawn(move || {
+            let start = Instant::now();
+            let result = focused_window(&p, my_uid()).is_none();
+            let _ = tx.send((result, start.elapsed()));
+        });
+        let (none, elapsed) = rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("connecting must not block");
+        assert!(none);
+        assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
+        drop((pending, listener));
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn only_a_socket_owned_by_the_kid_is_used() {
+        let body = br#"{"nodes":[{"focused":true,"pid":5,"id":9,"name":"Game","app_id":"game"}]}"#;
+        let socket = fake_sway(
+            "owned",
+            message(body, body.len() as u32),
+            1 << 20,
+            Duration::ZERO,
+        );
+        // Someone else's socket: not even connected to
+        assert!(focused_window(&socket, my_uid() + 1).is_none());
+        assert!(focused_window(&socket, my_uid()).is_some());
+        std::fs::remove_file(&socket).unwrap();
+        // A regular file where the socket should be
+        let file = socket.with_extension("file");
+        std::fs::write(&file, "").unwrap();
+        assert!(focused_window(&file, my_uid()).is_none());
+        std::fs::remove_file(&file).unwrap();
     }
 
     #[test]

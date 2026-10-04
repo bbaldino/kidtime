@@ -76,7 +76,7 @@ On a successful (2xx) response the agent:
 - empty body: drops every snapshot, so the next tick releases everything (a rollback to an old server stops
   enforcement instead of freezing the last rules forever);
 - a body that parses: replaces the snapshots, and drops the snapshot of any account the response leaves out;
-- a non-empty body that doesn't parse: keeps everything, with a warning in the log.
+- a non-empty body that doesn't parse, or a body that can't be read: keeps everything, with a warning in the log.
 
 ## Agent
 
@@ -141,7 +141,8 @@ trait Banner   { fn set(&self, lines: &[String]) ; }  // empty = off
 - **Re-lock.** logind lets a session's owner unlock it, and GNOME clears the lock when asked, so a kid can
   unlock their own session from inside it (`loginctl unlock-session` in a loop). Every second, for each blocked
   account, the agent reads its graphical sessions and locks any whose `LockedHint` is false (the 5-second tick
-  does the same). A session that was locked and is found unlocked counts as an unlock by the kid; the dashboard
+  does the same). A session observed locked (`LockedHint` true) and later observed unlocked counts as an unlock
+  by the kid (a lock request alone doesn't count: GNOME sets `LockedHint` a moment later); the dashboard
   shows "kid1 unlocked the session while blocked", at most once a minute per account. **Open question:**
   escalating after repeated unlocks (terminating the session) is not done.
 - **Login-screen banner.** Whenever the set of blocked, enforced accounts on this PC changes, set the login
@@ -220,8 +221,9 @@ GDM settings file, the state file). The unit gains `StateDirectory=kidtime`. nft
 ## Error handling
 
 - Hangs: every command the agent runs is killed (with its process group) and reaped after 5 seconds, and
-  reported as timed out; `gdbus call` also gets `--timeout 5`. The streaming Sway's IPC gets 2 seconds for the
-  whole exchange and replies over 16 MiB are refused. Files the kid controls (sunshine.conf, `.desktop` files,
+  reported as timed out; `gdbus call` also gets `--timeout 5`. The streaming Sway's IPC socket must be a socket
+  owned by the kid (checked with lstat); it is connected without blocking (a full backlog is an error), the
+  whole exchange gets 2 seconds, and replies over 16 MiB are refused. Files the kid controls (sunshine.conf, `.desktop` files,
   Steam manifests, `libraryfolders.vdf`, `shortcuts.vdf`) are opened non-blocking, must be regular files, and
   are read up to 1 MiB (16 MiB for `shortcuts.vdf`). A process owned by a tracked account is never taken for
   a login screen.

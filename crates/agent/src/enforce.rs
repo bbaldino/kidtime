@@ -94,7 +94,8 @@ struct Live {
     games_closed_on: Option<NaiveDate>,
     /// Login was already disabled by someone else when we blocked: leave it alone.
     external_lock: bool,
-    /// Sessions seen locked (or locked by us) while blocked: one of these found unlocked was unlocked from inside.
+    /// Sessions observed locked (LockedHint true) while blocked: one of these observed unlocked was unlocked
+    /// from inside. A lock request doesn't count: GNOME sets LockedHint a moment later, or never.
     locked_sessions: BTreeSet<String>,
     /// Unlocks while blocked, and when the last was reported.
     unlocks: u64,
@@ -424,8 +425,8 @@ impl Enforcer {
         }
     }
 
-    /// Locks every unlocked session. A session that was locked before and is unlocked now was unlocked from
-    /// inside (logind lets the owner do that): reported, at most once a minute per account.
+    /// Locks every unlocked session. A session observed locked before and observed unlocked now was unlocked
+    /// from inside (logind lets the owner do that): reported, at most once a minute per account.
     fn lock_sessions(
         &mut self,
         now: NaiveDateTime,
@@ -444,11 +445,8 @@ impl Enforcer {
                 continue;
             }
             unlocked |= live.locked_sessions.remove(&s.id);
-            match act.lock_session(&s.id) {
-                Ok(()) => {
-                    live.locked_sessions.insert(s.id.clone());
-                }
-                Err(e) => failures.push(format!("lock failed: {e:#}")),
+            if let Err(e) = act.lock_session(&s.id) {
+                failures.push(format!("lock failed: {e:#}"));
             }
         }
         let mut report = false;
@@ -1594,12 +1592,24 @@ mod tests {
             e.take_errors("kid1"),
             ["kid1 unlocked the session while blocked"]
         );
-        // Again 20 seconds later: locked again, not reported again yet
+        // Seen locked again, then unlocked 20 seconds after the report: locked again, not reported yet
+        e.relock(
+            t + chrono::Duration::seconds(10),
+            "kid1",
+            &[session("7", true)],
+            &mut fake,
+        );
         let t = t + chrono::Duration::seconds(20);
         e.relock(t, "kid1", &[session("7", false)], &mut fake);
         assert_eq!(fake.take(), ["lock 7"]);
         assert!(e.take_errors("kid1").is_empty());
-        // A minute after the report: reported again
+        // Seen locked, then unlocked a minute after the report: reported again
+        e.relock(
+            t + chrono::Duration::seconds(10),
+            "kid1",
+            &[session("7", true)],
+            &mut fake,
+        );
         let t = t + chrono::Duration::seconds(41);
         e.relock(t, "kid1", &[session("7", false)], &mut fake);
         assert_eq!(fake.take(), ["lock 7"]);
@@ -1613,6 +1623,52 @@ mod tests {
         fake.take();
         e.relock(tuesday(6, 15), "kid1", &[session("7", false)], &mut fake);
         assert!(fake.take().is_empty());
+    }
+
+    #[test]
+    fn a_lock_that_hasnt_taken_effect_yet_is_not_an_unlock() {
+        let mut e = enforcer(vec![snapshot("kid1", evenings())], at(20, 0));
+        let mut fake = Fake::default();
+        e.tick(at(21, 0), &[obs("kid1", false, vec![])], &mut fake);
+        e.take_errors("kid1");
+        fake.take();
+        // Lock requested, but GNOME hasn't set LockedHint yet: ask again, report nothing
+        let t = at(21, 0) + chrono::Duration::seconds(1);
+        e.relock(t, "kid1", &[session("7", false)], &mut fake);
+        assert_eq!(fake.take(), ["lock 7"]);
+        assert!(e.take_errors("kid1").is_empty());
+    }
+
+    #[test]
+    fn a_session_that_never_shows_locked_is_never_reported_as_unlocked() {
+        let mut e = enforcer(vec![snapshot("kid1", evenings())], at(20, 0));
+        let mut fake = Fake::default();
+        e.tick(at(21, 0), &[obs("kid1", false, vec![])], &mut fake);
+        e.take_errors("kid1");
+        for secs in 1..=180 {
+            let t = at(21, 0) + chrono::Duration::seconds(secs);
+            e.relock(t, "kid1", &[session("7", false)], &mut fake);
+        }
+        assert!(e.take_errors("kid1").is_empty());
+    }
+
+    #[test]
+    fn a_session_seen_locked_then_unlocked_is_reported_once() {
+        let mut e = enforcer(vec![snapshot("kid1", evenings())], at(20, 0));
+        let mut fake = Fake::default();
+        e.tick(at(21, 0), &[obs("kid1", false, vec![])], &mut fake);
+        e.take_errors("kid1");
+        let t = at(21, 0) + chrono::Duration::seconds(1);
+        e.relock(t, "kid1", &[session("7", true)], &mut fake);
+        let t = t + chrono::Duration::seconds(1);
+        e.relock(t, "kid1", &[session("7", false)], &mut fake);
+        // Not yet seen locked again: no second report
+        let t = t + chrono::Duration::seconds(1);
+        e.relock(t, "kid1", &[session("7", false)], &mut fake);
+        assert_eq!(
+            e.take_errors("kid1"),
+            ["kid1 unlocked the session while blocked"]
+        );
     }
 
     #[test]

@@ -216,14 +216,15 @@ async fn main() -> Result<()> {
                         if !pending.is_empty() {
                             tracing::info!("{} samples still queued", pending.len());
                         }
-                        let body = response.bytes().await.unwrap_or_else(|e| {
-                            tracing::debug!("reading the report response: {e}");
-                            Default::default()
-                        });
+                        let body = response.bytes().await.map_err(|e| e.to_string());
                         // The response resets the local count, so it only applies once the server has every
                         // sample counted here; with a backlog, the reply to the last batch does
                         if pending.is_empty() {
-                            handle_reply(&mut enforcer, &body, Local::now().naive_local());
+                            handle_reply(
+                                &mut enforcer,
+                                body.as_deref().map_err(Clone::clone),
+                                Local::now().naive_local(),
+                            );
                             save_if_dirty(&mut enforcer, &config.state_file);
                         }
                     }
@@ -358,9 +359,18 @@ fn parse_reply(body: &[u8]) -> Reply {
 }
 
 /// Applies a successful report response: no rules drops every snapshot (so the next tick releases
-/// everything); rules replace the snapshots; an unreadable body changes nothing.
-fn handle_reply(enforcer: &mut enforce::Enforcer, body: &[u8], local_now: NaiveDateTime) {
-    match parse_reply(body) {
+/// everything); rules replace the snapshots; a body that can't be read or parsed changes nothing.
+fn handle_reply(
+    enforcer: &mut enforce::Enforcer,
+    body: Result<&[u8], String>,
+    local_now: NaiveDateTime,
+) {
+    // A body that couldn't be read says nothing about the rules: like an unparseable one, keep them
+    let reply = match body {
+        Ok(body) => parse_reply(body),
+        Err(e) => Reply::Unreadable(format!("reading it failed: {e}")),
+    };
+    match reply {
         Reply::NoRules => {
             tracing::debug!("the server sent no rules");
             enforcer.clear_snapshots();
@@ -395,7 +405,7 @@ async fn observe(
         // The stream's focused window: this is how a non-Steam game in a stream can be closed
         if streaming_host && let Some(pattern) = &config.streaming_sway_socket {
             let socket = PathBuf::from(pattern.replace("{uid}", &user.uid.to_string()));
-            if let Some(window) = sway::focused_window(&socket) {
+            if let Some(window) = sway::focused_window(&socket, user.uid) {
                 let app = sway::app_for(&window, |appid| {
                     scanner.steam_name(user.uid, &user.home, appid, "")
                 });
@@ -516,7 +526,10 @@ async fn take_sample(
             .streaming_sway_socket
             .as_ref()
             .and_then(|pattern| {
-                sway::focused_window(Path::new(&pattern.replace("{uid}", &user.uid.to_string())))
+                sway::focused_window(
+                    Path::new(&pattern.replace("{uid}", &user.uid.to_string())),
+                    user.uid,
+                )
             })
             .map(|window| {
                 vec![sway::app_for(&window, |appid| {
@@ -690,7 +703,7 @@ mod tests {
             .and_hms_opt(12, 0, 0)
             .unwrap();
         let mut e = enforce::Enforcer::new(enforce::Persisted::default());
-        handle_reply(&mut e, reply_json(users, now).as_bytes(), now);
+        handle_reply(&mut e, Ok(reply_json(users, now).as_bytes()), now);
         assert_eq!(e.persisted.snapshots.len(), users.len());
         e.take_dirty();
         (e, now)
@@ -720,7 +733,7 @@ mod tests {
     #[test]
     fn an_empty_reply_drops_every_snapshot() {
         let (mut e, now) = enforcer_with(&["kid1", "kid2"]);
-        handle_reply(&mut e, b"", now);
+        handle_reply(&mut e, Ok(b""), now);
         assert!(e.persisted.snapshots.is_empty());
         assert!(e.take_dirty());
     }
@@ -728,14 +741,22 @@ mod tests {
     #[test]
     fn a_reply_with_rules_replaces_them_and_drops_omitted_accounts() {
         let (mut e, now) = enforcer_with(&["kid1", "kid2"]);
-        handle_reply(&mut e, reply_json(&["kid2"], now).as_bytes(), now);
+        handle_reply(&mut e, Ok(reply_json(&["kid2"], now).as_bytes()), now);
         assert_eq!(e.persisted.snapshots.keys().collect::<Vec<_>>(), ["kid2"]);
+    }
+
+    #[test]
+    fn a_reply_body_that_couldnt_be_read_keeps_everything() {
+        let (mut e, now) = enforcer_with(&["kid1", "kid2"]);
+        handle_reply(&mut e, Err("connection reset".into()), now);
+        assert_eq!(e.persisted.snapshots.len(), 2);
+        assert!(!e.take_dirty());
     }
 
     #[test]
     fn an_unreadable_reply_keeps_everything() {
         let (mut e, now) = enforcer_with(&["kid1", "kid2"]);
-        handle_reply(&mut e, b"<html>bad gateway</html>", now);
+        handle_reply(&mut e, Ok(b"<html>bad gateway</html>"), now);
         assert_eq!(e.persisted.snapshots.len(), 2);
         assert!(!e.take_dirty());
     }
