@@ -2057,4 +2057,16 @@ Do not push. Report the branch, commits, gate results, browser check results. La
    - reboot while blocked: still blocked after boot; allowed in the morning without the server;
    - `--uninstall` while blocked: login works again, no nftables table left;
    - Enforce off: everything released within one report cycle.
+   - Run every check with the agent under its systemd unit (NoNewPrivileges, ProtectSystem=strict, ProtectHome=read-only), not from a sudo shell: usermod, runuser+gdbus, setpriv+gsettings, dconf update, nft -f -.
+   - Reboot while blocked on the streaming host: the stream must still be cut after boot.
+   - Restart or upgrade the agent while blocked: the nft rules aren't doubled, and the kid stays blocked.
+   - `loginctl unlock-session` run from inside the kid's session while blocked.
+   - Locking over a fullscreen game on the desktop: LockedHint becomes true, and the re-lock works.
+   - A warning reaches the second PC while Moonlight is fullscreen there.
+   - Two kids blocked at once: the banner shows two lines, and releasing one leaves the other's nft rule in place.
+   - The banner is cleared after release, including on a login screen that starts after the block ended.
+   - The banner shows on the login screen at boot, read from the GDM dconf file.
+   - Editing sunshine.conf to a different port while blocked.
+   - `--release-all` and `--uninstall` with the server unreachable.
+   - Confirm where Sway gets the pid for Xwayland windows.
 5. Then `--stop-timekpr` on both PCs.

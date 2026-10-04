@@ -20,3 +20,10 @@ streaming_units = ["sway-sunshine.service"]
 # goes to the focused window (e.g. a game launched from Battle.net) instead of
 # every app that happens to be running there.
 streaming_sway_socket = "/run/user/{uid}/sway-sunshine.sock"
+
+# Sunshine base port per account, used to cut a blocked kid's stream (ports base-5 to base+21).
+# Set it on a streaming host: without it the port is read from the kid's own
+# ~/.config/sunshine/sunshine.conf, which the kid can edit, and then Sunshine's default (47989).
+# [sunshine_ports]
+# kid1 = 48189
+# kid2 = 48089

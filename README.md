@@ -123,16 +123,17 @@ After that, use "Add to Home Screen" (iOS Safari) or "Install app" (Android Chro
 
 The dashboard has three tabs.
 
-- **Today** shows each kid's usage, what the rules say right now, an **Enforce** switch per kid, and a log of
-  what kidtime did (or would have done, while Enforce is off).
-- **Rules** sets, per kid and per weekday, the allowed hours and a games budget, plus one-off blackouts.
+- **Today** shows each kid's usage, what the rules say right now, and a log of what kidtime did (or would have
+  done, while Enforce is off).
+- **Rules** has an **Enforce** switch per kid, and sets, per kid and per weekday, the allowed hours and a games
+  budget, plus one-off blackouts.
   "Copy this week to" replaces another kid's whole week with the one shown (blackouts are not copied).
 - **Apps** lists every app seen and its category. Games and uncategorised apps use the games budget; move apps
   you don't care about to **Ignored** to hide them from Today and stop them counting.
 
 ## Enforcement
 
-Each kid has an **Enforce** switch on the Today tab. It is off by default, and while it is off the agents only
+Each kid has an **Enforce** switch on the Rules tab. It is off by default, and while it is off the agents only
 report. Turning it on is picked up within one report cycle.
 
 With it on, each agent decides locally every 5 seconds, from the latest rules the server sent. So it
@@ -142,10 +143,16 @@ keeps enforcing if the server is down or the PC is offline (the rules are saved 
   budget runs out. They show on the desktop and in a Moonlight stream.
 - **At the end of allowed time or a blackout:** the session is locked and the account's login is disabled
   (`usermod -L`), so the lock can't be unlocked with a password. It is re-enabled when allowed time
-  returns. An account that has no password can't have its login disabled; it gets the session lock only,
-  and a one-time warning in the agent's log. An account that was already locked is never unlocked.
+  returns. Blocked sessions are checked every second and locked again if the kid unlocks them from inside
+  (which logind allows); the dashboard shows that it happened. An account that has no password can't have
+  its login disabled; it gets the session lock only, and an error on the dashboard. An account that was
+  already locked is never unlocked, and that is shown on the dashboard too. If a parent runs `usermod -L` on
+  a kid while kidtime is blocking them, kidtime unlocks the account when the block ends.
 - **Streams are cut:** traffic to the kid's Sunshine ports is dropped (an nftables table, `inet kidtime`),
-  so Moonlight disconnects within seconds and can't reconnect. Afterwards the stream can be resumed.
+  so Moonlight disconnects within seconds and can't reconnect. Afterwards the stream can be resumed. The
+  ports come from `sunshine_ports` in the agent config if set (recommended: the kid can edit their own
+  `sunshine.conf`), otherwise from the kid's `sunshine.conf`, otherwise Sunshine's default. The rules are
+  checked and repaired every 5 seconds while the kid is blocked.
 - **Games budget used up:** apps in the Games category are closed (SIGTERM, then SIGKILL after 10 seconds)
   and kept closed. Apps that aren't categorised count toward the budget but are never closed; they show on
   the dashboard instead.
@@ -158,7 +165,7 @@ The dashboard shows what enforcement did, and any action that failed (it is retr
 **Retiring timekpr:** once you trust kidtime, run `sudo deploy/install-agent.sh --stop-timekpr` on each PC.
 
 **Recovery.** If the agent is broken, or you need a kid unlocked right now. If the server is reachable, the
-quickest way is to switch Enforce off for that kid on the Today tab and wait 15 seconds: everything is released
+quickest way is to switch Enforce off for that kid on the Rules tab and wait 15 seconds: everything is released
 and the agent keeps running. Otherwise stop the agent first. While it runs, it undoes a manual `usermod -U`
 within seconds, and after a reboot it starts again and re-blocks from its saved rules.
 
@@ -170,9 +177,11 @@ sudo nft delete table inet kidtime     # remove the stream block by hand
 sudo rm -f /etc/dconf/db/gdm.d/90-kidtime && sudo dconf update   # clear the login-screen banner
 ```
 
-`--release-all` exits non-zero if anything remains. `sudo deploy/install-agent.sh --uninstall` stops the
-agent, runs `--release-all`, and removes the unit, binary, config and state only if that succeeds. It removes
-nothing if the agent won't stop, or if the state file exists but the binary is gone.
+`--release-all` exits non-zero if anything remains. It works from the state file alone if the config can't be
+read. `sudo deploy/install-agent.sh --uninstall` stops the agent, runs `--release-all`, and only if that
+succeeds removes the unit, binary, config, state and the login-screen banner settings (the GDM profile
+override only if the install script wrote it). It removes nothing if the agent won't stop, or if the state file
+exists but the binary is gone.
 
 ## Who can see and change things
 

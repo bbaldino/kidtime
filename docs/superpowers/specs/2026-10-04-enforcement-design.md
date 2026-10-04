@@ -72,6 +72,12 @@ event log and validation.
 Compatibility: an old agent ignores the response body. A new agent receiving the old empty 204 treats it as
 "no snapshot" and enforces nothing. Either side can be upgraded first.
 
+On a successful (2xx) response the agent:
+- empty body: drops every snapshot, so the next tick releases everything (a rollback to an old server stops
+  enforcement instead of freezing the last rules forever);
+- a body that parses: replaces the snapshots, and drops the snapshot of any account the response leaves out;
+- a non-empty body that doesn't parse: keeps everything, with a warning in the log.
+
 ## Agent
 
 ### State
@@ -119,12 +125,25 @@ trait Banner   { fn set(&self, lines: &[String]) ; }  // empty = off
   - stream, on a host with `streaming_sway_socket`: `swaymsg -s <socket> exec "swaynag --layer overlay
     --edge top -t warning -m '<text>'"`, as the kid.
   Texts: "10 minutes left today: the computer locks at 9:00pm", "5 minutes of games left today",
-  "1 minute left: save your game". A warning never delays the action it announces.
-- **Lock.** When the decision becomes blocked: disable login (`usermod -L <kid>`, recorded), send the
-  notification "Computer time is over until <time>", and `loginctl lock-session` each graphical session of
-  the kid on this PC. Every 5 seconds while blocked, lock any of their sessions whose `LockedHint` is false.
+  "1 minute left: save your game". A warning never delays the action it announces. 00:00 reads "midnight"
+  ("locks at midnight", "until midnight"); a midnight more than a day away keeps the day ("Thu 12:00am").
+- **Lock.** When the decision becomes blocked: disable login (`usermod -L <kid>`, recorded), `loginctl
+  lock-session` each graphical session of the kid on this PC, then send the notification "Computer time is
+  over until <time>" (after the locks, so nothing delays them). The record is written to the state file
+  (atomically, fsynced, mode 600) *before* `usermod -L` runs; if that write fails, login is not disabled (the
+  session lock still applies), the dashboard shows "couldn't save state; not disabling login", and it is retried
+  next tick. So a crash or power loss can never leave a disabled login that the agent doesn't know it disabled.
   When allowed again: `usermod -U <kid>` (only if the agent recorded disabling it).
-  An account that was already password-locked before the agent acted is never unlocked by the agent.
+  An account that was already password-locked before the agent acted is never unlocked by the agent; that, and
+  an account with no password (session lock only), are shown on the dashboard once per agent run. While an
+  enforced account is allowed, a disabled login the agent didn't record is reported once ("login for kid1 is
+  disabled but kidtime didn't do it; if it should be enabled run `sudo usermod -U kid1`"), never undone.
+- **Re-lock.** logind lets a session's owner unlock it, and GNOME clears the lock when asked, so a kid can
+  unlock their own session from inside it (`loginctl unlock-session` in a loop). Every second, for each blocked
+  account, the agent reads its graphical sessions and locks any whose `LockedHint` is false (the 5-second tick
+  does the same). A session that was locked and is found unlocked counts as an unlock by the kid; the dashboard
+  shows "kid1 unlocked the session while blocked", at most once a minute per account. **Open question:**
+  escalating after repeated unlocks (terminating the session) is not done.
 - **Login-screen banner.** Whenever the set of blocked, enforced accounts on this PC changes, set the login
   screen's banner to one line per blocked kid ("kid1: computer time is over until 6:15am"; "kid2: blackout until
   Sat 9:00am: grounded"), or turn it off when nobody is blocked. Written live to the running login screen: find
@@ -133,11 +152,14 @@ trait Banner   { fn set(&self, lines: &[String]) ; }  // empty = off
   starts later reads the same values from the GDM system settings file (`/etc/dconf/db/gdm.d/90-kidtime`,
   rewritten with `dconf update`), which the install script enables with a profile override
   (`/etc/dconf/profile/gdm`: `user-db:user`, `system-db:gdm`, then the stock `file-db` line).
-- **Cut the stream.** On a host with `streaming_units`, while the kid is blocked: add an nftables rule (table
+- **Cut the stream.** On a host with `streaming_units`, while the kid is blocked: add nftables rules (table
   `inet kidtime`, input hook, priority -10) dropping TCP and UDP to the kid's Sunshine ports
-  (`base-5`…`base+21`, base read from `~kid/.config/sunshine/sunshine.conf`, default 47989) from any
-  interface except loopback. Remove it when allowed. The agent owns the whole `inet kidtime` table and
-  recreates it from its state at start.
+  (`base-5`…`base+21`) from any interface except loopback. The base comes from the agent config's
+  `sunshine_ports` table (`{ kid1 = 48189 }`) first, since the kid can edit their own sunshine.conf; then
+  `~kid/.config/sunshine/sunshine.conf` (`port = N`); then 47989. The source is logged once per kid. Every
+  blocked tick the agent checks that both the TCP and the UDP rule exist with the right range, deletes the
+  kid's rules with a wrong range, and adds what is missing, so the block survives a reboot, a manual rule
+  removal or a port change. Remove the rules when allowed. The agent owns the whole `inet kidtime` table.
 - **Close games.** While the Games budget is used up: for each running app of the kid whose id is in `games`,
   close it: a stream window through Sway (`[pid=…] kill`), otherwise SIGTERM to its processes (a Steam game's
   process tree under `reaper`, a desktop app's GNOME scope), then SIGKILL after 10 seconds. Repeat every 5
@@ -152,9 +174,12 @@ streams) alongside the `App`.
 - At start: load the state file (ignore it, with an error logged, if unreadable), recreate the nftables
   table from the recorded blocks, and re-enable login for any recorded account whose snapshot now allows it
   or has `enforce = false`.
+- An account taken out of the agent config is released on the next tick (login re-enabled, stream unblocked)
+  and its snapshot dropped.
 - On SIGTERM: leave locks and blocks in place (the agent is being restarted or the PC shut down; the next
   start reconciles). `kidtime-agent --release-all` (used by uninstall) unlocks every recorded account and
-  removes the nftables table.
+  removes the nftables table. It works from the state file alone (at its default path) when the config can't
+  be read, and exits non-zero if anything remains.
 
 ### Clock
 
@@ -188,9 +213,20 @@ GDM settings file, the state file). The unit gains `StateDirectory=kidtime`. nft
 - `--stop-timekpr`: stops and disables timekpr's service on that PC.
 - Writes the GDM profile override so later login screens read kidtime's banner settings.
 - `--uninstall`: stops the agent first, runs `kidtime-agent --release-all`, then removes the unit, binary, config
-  and state; it removes nothing if the release fails or the agent won't stop.
+  and state, plus `/etc/dconf/db/gdm.d/90-kidtime` and the GDM profile override (only if its first line is
+  `# written by kidtime`, which the script writes), then `dconf update`; it removes nothing if the release fails
+  or the agent won't stop.
 
 ## Error handling
+
+- Hangs: every command the agent runs is killed (with its process group) and reaped after 5 seconds, and
+  reported as timed out; `gdbus call` also gets `--timeout 5`. The streaming Sway's IPC gets 2 seconds for the
+  whole exchange and replies over 16 MiB are refused. Files the kid controls (sunshine.conf, `.desktop` files,
+  Steam manifests, `libraryfolders.vdf`, `shortcuts.vdf`) are opened non-blocking, must be regular files, and
+  are read up to 1 MiB (16 MiB for `shortcuts.vdf`). A process owned by a tracked account is never taken for
+  a login screen.
+- Closing games signals a pid only if `/proc/<pid>/status` shows the kid's uid as its real uid: a stream
+  window's pid comes from the kid's own Sway (for Xwayland, from a property the client sets).
 
 - Server unreachable: enforce from the saved snapshot. The dashboard shows the host offline as now. Time counted
   locally since the last snapshot is lost if the agent restarts while the server is unreachable (an accepted undercount).
