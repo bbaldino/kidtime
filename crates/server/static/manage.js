@@ -134,9 +134,17 @@ async function renderRules(focusSel, message) {
       </div>
       <p class="form-error" id="copy-error" role="alert" hidden></p>
       <p class="footnote" id="copy-done" role="status" hidden></p>` : "";
+  const enforceHtml = `
+      <label class="switch enforce">
+        <input type="checkbox" id="enforce" ${rules.enforce ? "checked" : ""}>
+        Enforce for ${esc(rulesUser)}
+      </label>
+      <p class="footnote">Off: kidtime only shows what it would do. On: the PCs lock, close games and cut streams.</p>
+      <p class="form-error" id="enforce-error" role="alert" hidden></p>`;
   rulesEl.innerHTML = `
     <article class="card">
       <div class="chips" role="group" aria-label="Account">${picker}</div>
+      ${enforceHtml}
       <ul class="week-rules">${days}</ul>
       ${copyWeek}
     </article>
@@ -221,7 +229,25 @@ function renderRulesKeepingEdits(focusSel) {
   refocus(li, focusSel);
 }
 
-rulesEl.addEventListener("change", (e) => {
+rulesEl.addEventListener("change", async (e) => {
+  if (e.target.id === "enforce") {
+    const box = e.target;
+    const error = document.getElementById("enforce-error");
+    error.hidden = true;
+    if (box.checked && !confirm(`Turn on enforcement for ${rulesUser}? Their PCs will lock and close games by these rules.`)) {
+      box.checked = false;
+      return;
+    }
+    try {
+      await api(`/api/accounts/${encodeURIComponent(rulesUser)}/enforce`, { method: "PUT", body: { enforce: box.checked } });
+    } catch (err) {
+      box.checked = !box.checked;
+      // A TypeError is fetch failing to reach the server; its own text ("Failed to fetch") means little here
+      error.textContent = err instanceof TypeError ? "Couldn't save. Try again." : err.message || "Couldn't save. Try again.";
+      error.hidden = false;
+    }
+    return;
+  }
   const form = e.target.closest("form[data-weekday]");
   if (!form || (e.target.name !== "restricted" && e.target.name !== "limited")) return;
   week[editing] = readEditor(form);
@@ -300,6 +326,7 @@ async function renderApps(focusApp, message) {
     <article class="card">
       <p class="footnote">Games and uncategorised apps count toward the games budget, so a new game counts from its first minute. Steam games and anything played in a stream are set to Games automatically. Move apps you don't care about to Ignored.</p>
       <p class="footnote">At the desktop an app counts while it is open and the kid is active, even in the background. Games launched outside Steam at the desktop may not be detected.</p>
+      <p class="footnote">If you put Steam itself in Games, running out of games time closes Steam along with its games.</p>
       ${anyNew ? '<div class="card-actions"><button type="button" data-review-all>Mark all as reviewed</button></div>' : ""}
       <p class="form-error" id="apps-error" role="alert" hidden></p>
       <ul class="apps">${rows || `<li class="empty-note">${ignored.length ? "Every app is ignored." : "No apps seen yet."}</li>`}</ul>

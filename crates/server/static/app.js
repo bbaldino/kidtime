@@ -49,6 +49,7 @@ async function api(path, { method = "GET", body } = {}) {
 }
 
 let categories = [];
+let appNames = new Map(); // app id -> name, only fetched while some kid has an overrun
 const categoryName = (id) => categories.find((c) => c.id === id)?.name ?? "Uncategorised";
 
 // With `withDate`, another day reads "Sat Oct 10, 5:00pm" rather than "Sat 5:00pm"
@@ -65,26 +66,34 @@ function clock(text, withDate = false) {
 }
 
 function decisionHtml(u) {
-  if (!u.decision) return "";
+  const errors = u.errors?.length ? `<p class="form-error">${u.errors.map(esc).join("; ")}</p>` : "";
+  const names = (u.overrun ?? []).map((id) => appNames.get(id) ?? id);
+  const overrun = names.length
+    ? `<p class="decision-note">${names.map(esc).join(", ")} ${names.length === 1 ? "is" : "are"} uncategorised and kept running after the games budget ran out. <a href="#" data-goto="apps">Sort in Apps</a></p>`
+    : "";
+  if (!u.decision) return overrun + errors;
   const d = u.decision;
   // An account with no rules of its own can still be named in a blackout
-  if (!u.restricted && d.computer.state === "allowed") return "";
+  if (!u.restricted && d.computer.state === "allowed") return overrun + errors;
+  const locked = u.enforce ? "Locked" : "Would be locked";
   let line;
   if (d.computer.state === "allowed") {
     // next_change is not always the moment the state flips, so only name a time when it isn't just midnight
     const midnight = d.next_change?.split("T")[1] === "00:00:00";
     line = !d.next_change || midnight ? "Allowed" : `Allowed until ${esc(clock(d.next_change))}`;
-  } else if (d.computer.state === "blackout") line = `Would be locked: blackout until ${esc(clock(d.computer.until))}${d.computer.note ? ` (${esc(d.computer.note)})` : ""}`;
-  else line = "Would be locked: outside allowed hours";
+  } else if (d.computer.state === "blackout") line = `${locked}: blackout until ${esc(clock(d.computer.until))}${d.computer.note ? ` (${esc(d.computer.note)})` : ""}`;
+  else line = `${locked}: outside allowed hours`;
   const budgets = d.categories.map((c) => c.used_up
-    ? `<li><strong>${esc(categoryName(c.category))}</strong> budget used up</li>`
+    ? `<li><strong>${esc(categoryName(c.category))}</strong> budget used up${c.category === GAMES /* from manage.js */ && u.enforce ? ": games closed" : ""}</li>`
     : `<li><strong>${esc(categoryName(c.category))}</strong> ${duration(c.left_secs)} left</li>`).join("");
-  return `<div class="decision"><p>${line}</p>${budgets ? `<ul>${budgets}</ul>` : ""}</div>`;
+  return `<div class="decision"><p>${line}</p>${budgets ? `<ul>${budgets}</ul>` : ""}${overrun}</div>${errors}`;
 }
 
 const EVENT_TEXT = {
-  locked: (e) => `Would have locked: ${e.detail}`,
-  closed: (e) => `Would have closed ${e.detail.toLowerCase()}: ${e.detail} budget used up`,
+  locked: (e) => `${e.enforced ? "Locked" : "Would have locked"}: ${e.detail}`,
+  closed: (e) => e.enforced
+    ? `Closed ${e.detail.toLowerCase()}: ${e.detail} budget used up`
+    : `Would have closed ${e.detail.toLowerCase()}: ${e.detail} budget used up`,
   allowed: () => "Allowed again",
 };
 
@@ -92,7 +101,7 @@ function eventsHtml(events) {
   if (!events.length) return '<li class="empty-note">Nothing yet.</li>';
   return events.map((e) => {
     const when = new Date(e.at * 1000).toLocaleString(undefined, { weekday: "short", hour: "numeric", minute: "2-digit" });
-    return `<li><span class="event-when">${esc(when)}</span> <span class="event-who">${esc(e.user)}</span> ${esc((EVENT_TEXT[e.kind] ?? (() => e.kind))(e))}</li>`;
+    return `<li><span class="event-when">${esc(when)}</span> <span class="event-who">${esc(e.user)}</span> ${esc((EVENT_TEXT[e.kind] ?? (() => e.kind))(e))}${e.host ? ` on ${esc(e.host)}` : ""}</li>`;
   }).join("");
 }
 
@@ -201,6 +210,10 @@ async function refresh() {
     const [status, events] = await Promise.all([api("/api/status"), api("/api/events")]);
     // Without the names the cards still render; the next refresh asks again
     if (!categories.length) categories = await api("/api/categories").catch(() => []);
+    // Overrun apps come as ids; names are nice to have, so a failed fetch just shows ids
+    if (status.users.some((u) => u.overrun?.length)) {
+      appNames = new Map((await api("/api/apps").catch(() => [])).map((a) => [a.app_id, a.name]));
+    }
     hideTip();
     usersEl.innerHTML = status.users.length
       ? status.users.map(cardHtml).join("")
@@ -225,6 +238,12 @@ function showTab(name) {
   window.dispatchEvent(new CustomEvent("kidtime:tab", { detail: name }));
 }
 for (const t of tabs) t.addEventListener("click", () => showTab(t.dataset.tab));
+document.addEventListener("click", (e) => {
+  const link = e.target.closest?.("[data-goto]");
+  if (!link) return;
+  e.preventDefault();
+  showTab(link.dataset.goto);
+});
 
 refresh();
 setInterval(() => { if (!document.hidden) refresh(); }, REFRESH_MS);
