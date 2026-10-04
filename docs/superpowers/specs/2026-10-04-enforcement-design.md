@@ -25,6 +25,7 @@ while the server is unreachable; and a parent can switch it off per kid from the
 | Games budget used up | Close apps in the Games category and keep them closed. Uncategorised apps keep counting but are not closed; they are flagged on the dashboard. |
 | Games behind a lock | Keep running indefinitely. (A "close games after N minutes of lock" option can be added later.) |
 | Server unreachable | Keep enforcing from the last rules received. A PC that has never heard from the server enforces nothing. |
+| Midnight | The snapshot carries the account's rule for all seven weekdays, so a block in force at midnight holds, and a lock at midnight is warned about, even if the server can't be reached then. |
 | Switching it on | A per-kid Enforce switch on the Rules tab, off by default. |
 | Where the decision is made | The agent always decides locally, with the same decision function as the server, from the latest snapshot the server sent. |
 | timekpr | Runs alongside until the parent is satisfied; the install script gains an option to stop it. |
@@ -55,7 +56,7 @@ ReportResponse {
 AccountSnapshot {
   user: String,
   enforce: bool,
-  day: DayRule,                         // today's weekday rule
+  week: Vec<DayRule>,                   // the account's rule for each weekday, Monday first
   blackouts: Vec<BlackoutSpan>,         // blackouts that apply to this account and haven't ended
   used_secs: BTreeMap<CategoryId, i64>, // today's merged, cross-PC category time
   games: Vec<String>,                   // app ids in the Games category (the ones the agent may close)
@@ -91,9 +92,9 @@ the games budget, as on the server. Only apps in `games` are ever closed.
 A second tokio task alongside the existing sampling loop, every 5 seconds:
 
 1. For each account with a snapshot and `enforce = true`, compute
-   `decide(day, blackouts, used + local, now + offset)`. A snapshot whose `for_day` is before today keeps
-   its weekday rule only if it's the same weekday; otherwise the account is treated as having no rule for
-   the day (unrestricted, no budget) until the server answers. Blackouts always apply, since they are
+   `decide(day, blackouts, used + local, now + offset)`. The rule for the current weekday comes from
+   `week`; `used_secs` counts only when `for_day` is today. The whole week travels so that a block in force
+   at midnight holds, and a lock at midnight is warned about, even when the server can't be reached then. Blackouts always apply, since they are
    absolute times.
 2. Compare with what the agent did last time and act (below).
 3. Accounts with `enforce = false` or no snapshot: undo anything the agent did to them (unlock login,

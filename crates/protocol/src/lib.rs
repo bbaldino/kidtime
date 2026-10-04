@@ -61,9 +61,11 @@ pub struct AccountSnapshot {
     pub user: String,
     /// Off: the agent leaves the account alone and undoes anything it did.
     pub enforce: bool,
-    /// The day `day` and `used_secs` belong to.
+    /// The day `used_secs` belongs to.
     pub for_day: NaiveDate,
-    pub day: rules::DayRule,
+    /// The account's rule for each weekday: exactly 7, Monday first (index = `num_days_from_monday`). The
+    /// whole week travels so an agent that is offline over midnight still knows the next day's rule.
+    pub week: Vec<rules::DayRule>,
     /// Blackouts that apply to this account and haven't ended.
     pub blackouts: Vec<rules::BlackoutSpan>,
     /// Today's category time across all PCs, merged.
@@ -122,7 +124,7 @@ mod tests {
                 user: "kid1".into(),
                 enforce: true,
                 for_day: day,
-                day: rules::DayRule::default(),
+                week: vec![rules::DayRule::default(); 7],
                 blackouts: vec![rules::BlackoutSpan {
                     start: day.and_hms_opt(17, 0, 0).unwrap(),
                     end: day.and_hms_opt(19, 0, 0).unwrap(),

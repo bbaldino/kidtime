@@ -80,7 +80,8 @@ struct Live {
     /// Warnings already shown, keyed by what they announced.
     warned: BTreeSet<String>,
     blocked: bool,
-    games_closed: bool,
+    /// The day the "games used up" notice was shown.
+    games_closed_on: Option<NaiveDate>,
     /// Login was already disabled by someone else when we blocked: leave it alone.
     external_lock: bool,
     overrun: Vec<String>,
@@ -96,16 +97,11 @@ pub struct Enforcer {
 
 impl Enforcer {
     pub fn new(persisted: Persisted) -> Self {
-        // If someone was blocked when the agent stopped, the banner may still be up: set it on the first tick
-        let banner = if persisted.login_disabled.is_empty() {
-            Some(Vec::new())
-        } else {
-            None
-        };
+        // The banner may be up from before a restart: always set it on the first tick
         Self {
             persisted,
             live: BTreeMap::new(),
-            banner,
+            banner: None,
             dirty: false,
         }
     }
@@ -117,13 +113,15 @@ impl Enforcer {
         } else {
             0
         };
-        if offset != self.persisted.clock_offset_secs {
-            if offset != 0 {
+        let stored = self.persisted.clock_offset_secs;
+        if offset != stored {
+            if offset != 0 && (offset - stored).abs() > 60 {
                 tracing::warn!(
                     "this PC's clock is {offset}s off the server's; using the server's time"
                 );
             }
             self.persisted.clock_offset_secs = offset;
+            self.dirty = true;
         }
         for snap in &response.accounts {
             // The server's figure now includes everything this PC reported
@@ -133,9 +131,9 @@ impl Enforcer {
                 self.persisted
                     .snapshots
                     .insert(snap.user.clone(), snap.clone());
+                self.dirty = true;
             }
         }
-        self.dirty = true;
     }
 
     /// Adds a sample's time to the account's local count, the way the server counts games time.
@@ -174,6 +172,9 @@ impl Enforcer {
                 Some(s) if s.enforce => s.clone(),
                 _ => {
                     self.let_go(&o.user, act);
+                    if let Some(live) = self.live.get_mut(&o.user) {
+                        live.overrun.clear();
+                    }
                     continue;
                 }
             };
@@ -241,15 +242,11 @@ impl Enforcer {
         std::mem::take(&mut self.dirty)
     }
 
-    /// The decision for a snapshot at `now`, with this PC's uncounted time added. A snapshot from another day
-    /// keeps its weekday rule only on the same weekday; its usage never carries over.
+    /// The decision for a snapshot at `now`, with this PC's uncounted time added. The rule comes from the
+    /// snapshot's week, so it holds on any day; usage counts only on the snapshot's own day.
     fn decision(&self, snap: &AccountSnapshot, now: NaiveDateTime) -> Decision {
         let today = now.date();
-        let day = if snap.for_day == today || snap.for_day.weekday() == today.weekday() {
-            snap.day.clone()
-        } else {
-            DayRule::default()
-        };
+        let day = week_rule(snap, today);
         let mut used = if snap.for_day == today {
             snap.used_secs.clone()
         } else {
@@ -275,27 +272,15 @@ impl Enforcer {
             if !self.persisted.login_disabled.contains(user) {
                 match act.login_disabled(user) {
                     Ok(true) => self.live.get_mut(user).unwrap().external_lock = true,
-                    Ok(false) => match act.disable_login(user) {
-                        Ok(()) => {
-                            self.persisted.login_disabled.insert(user.clone());
-                            self.dirty = true;
-                        }
-                        Err(e) => self.error(user, format!("disabling login failed: {e:#}")),
-                    },
+                    Ok(false) => self.disable(user, act),
                     Err(e) => self.error(user, format!("checking login failed: {e:#}")),
                 }
             }
             act.notify(user, &format!("Computer time is over {reason}"));
-        } else if !self.persisted.login_disabled.contains(user) && !self.live[user].external_lock {
-            // A failed disable is retried every tick
+        } else if !self.live[user].external_lock {
+            // A failed disable (or check) is retried every tick
             if let Ok(false) = act.login_disabled(user) {
-                match act.disable_login(user) {
-                    Ok(()) => {
-                        self.persisted.login_disabled.insert(user.clone());
-                        self.dirty = true;
-                    }
-                    Err(e) => self.error(user, format!("disabling login failed: {e:#}")),
-                }
+                self.disable(user, act);
             }
         }
         for s in o.sessions.iter().filter(|s| !s.locked) {
@@ -311,6 +296,17 @@ impl Enforcer {
                 }
                 Err(e) => self.error(user, format!("cutting the stream failed: {e:#}")),
             }
+        }
+    }
+
+    /// Records the account as disabled by us *before* disabling it, so a disable that took effect but reported
+    /// failure is still undone later (re-enabling an account that was enabled is harmless).
+    fn disable(&mut self, user: &str, act: &mut dyn Actions) {
+        if self.persisted.login_disabled.insert(user.to_string()) {
+            self.dirty = true;
+        }
+        if let Err(e) = act.disable_login(user) {
+            self.error(user, format!("disabling login failed: {e:#}"));
         }
     }
 
@@ -388,14 +384,18 @@ impl Enforcer {
         let counted_running = o.running.iter().any(|a| !snap.ignored.contains(&a.id));
         if !games.used_up {
             self.live.entry(user.clone()).or_default().overrun.clear();
-            self.live.entry(user.clone()).or_default().games_closed = false;
+            self.live.entry(user.clone()).or_default().games_closed_on = None;
             if present
                 && counted_running
                 && !blocked
                 && let Some(threshold) = nearest_threshold(games.left_secs)
             {
                 // The budget's size is part of the key, so raising it warns again
-                let budget = snap.day.budgets.get(&GAMES).copied().unwrap_or(0);
+                let budget = week_rule(snap, now.date())
+                    .budgets
+                    .get(&GAMES)
+                    .copied()
+                    .unwrap_or(0);
                 let key = format!("games:{}:{budget}:{threshold}", now.date());
                 let text = if threshold == 60 {
                     "1 minute of games left today: save your game".to_string()
@@ -411,8 +411,8 @@ impl Enforcer {
             return;
         }
         let live = self.live.entry(user.clone()).or_default();
-        if !live.games_closed {
-            live.games_closed = true;
+        if present && live.games_closed_on != Some(now.date()) {
+            live.games_closed_on = Some(now.date());
             act.notify(&user, "Games time is used up for today");
         }
         let mut overrun = Vec::new();
@@ -455,26 +455,51 @@ fn nearest_threshold(left: i64) -> Option<i64> {
         .find(|&t| left > 0 && left <= t)
 }
 
-/// "until 6:15am", "until 7:00pm (dinner)", "until Sat 9:00am", or "for today".
+/// "until 6:15am", "until 7:00pm (dinner)", "until Tue 6:15am", or "for now" when nothing in the week allows it.
 fn blocked_reason(snap: &AccountSnapshot, d: &Decision, now: NaiveDateTime) -> String {
     match &d.computer {
         Computer::Blackout { until, note } if note.is_empty() => {
             format!("until {}", clock(*until, now))
         }
         Computer::Blackout { until, note } => format!("until {} ({note})", clock(*until, now)),
-        _ => {
-            // The next allowed stretch today, or tomorrow's first one if the snapshot's rule is for every day
-            let today_start = snap.day.stretches.iter().map(|s| s.start_min).find(|&m| {
-                now.date().and_time(chrono::NaiveTime::MIN)
-                    + chrono::Duration::minutes(i64::from(m))
-                    > now
-            });
-            match today_start.or_else(|| snap.day.stretches.iter().map(|s| s.start_min).min()) {
-                Some(m) => format!("until {}", minute_clock(m)),
-                None => "for today".to_string(),
+        _ => match next_allowed(snap, now) {
+            Some(t) => format!("until {}", clock(t, now)),
+            None => "for now".to_string(),
+        },
+    }
+}
+
+/// The snapshot's rule for any date; a short week (never sent by the server) means no rule.
+fn week_rule(snap: &AccountSnapshot, date: NaiveDate) -> DayRule {
+    snap.week
+        .get(date.weekday().num_days_from_monday() as usize)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// The first moment after `now`, within a week, that the schedule allows the computer.
+fn next_allowed(snap: &AccountSnapshot, now: NaiveDateTime) -> Option<NaiveDateTime> {
+    for days in 0..=7u64 {
+        let date = now.date() + chrono::Days::new(days);
+        let midnight = date.and_time(chrono::NaiveTime::MIN);
+        let rule = week_rule(snap, date);
+        if !rule.restricted {
+            if midnight > now {
+                return Some(midnight);
             }
+            continue;
+        }
+        let start = rule
+            .stretches
+            .iter()
+            .map(|s| midnight + chrono::Duration::minutes(i64::from(s.start_min)))
+            .filter(|&t| t > now)
+            .min();
+        if start.is_some() {
+            return start;
         }
     }
+    None
 }
 
 fn minute_clock(minutes: u16) -> String {
@@ -508,6 +533,7 @@ mod tests {
         calls: Vec<String>,
         already_locked: BTreeSet<String>,
         fail_lock: bool,
+        fail_disable: bool,
         banner: Vec<String>,
     }
 
@@ -525,10 +551,15 @@ mod tests {
         }
         fn disable_login(&mut self, user: &str) -> anyhow::Result<()> {
             self.calls.push(format!("disable {user}"));
+            self.already_locked.insert(user.to_string());
+            if self.fail_disable {
+                anyhow::bail!("usermod said no");
+            }
             Ok(())
         }
         fn enable_login(&mut self, user: &str) -> anyhow::Result<()> {
             self.calls.push(format!("enable {user}"));
+            self.already_locked.remove(user);
             Ok(())
         }
         fn notify(&mut self, user: &str, text: &str) {
@@ -571,7 +602,7 @@ mod tests {
             user: user.into(),
             enforce: true,
             for_day: day(),
-            day: rule,
+            week: vec![rule; 7],
             blackouts: vec![],
             used_secs: BTreeMap::new(),
             games: vec!["steam:1".into()],
@@ -639,7 +670,10 @@ mod tests {
         e.tick(at(20, 50), &[obs("kid1", false, vec![])], &mut fake);
         assert_eq!(
             fake.take(),
-            ["notify kid1: 10 minutes left today: the computer locks at 9:00pm"]
+            [
+                "notify kid1: 10 minutes left today: the computer locks at 9:00pm",
+                "banner "
+            ]
         );
         e.tick(at(20, 51), &[obs("kid1", false, vec![])], &mut fake);
         assert!(fake.take().is_empty(), "the 10-minute warning fires once");
@@ -662,7 +696,10 @@ mod tests {
         e.tick(at(20, 57), &[obs("kid1", false, vec![])], &mut fake);
         assert_eq!(
             fake.take(),
-            ["notify kid1: 5 minutes left today: the computer locks at 9:00pm"]
+            [
+                "notify kid1: 5 minutes left today: the computer locks at 9:00pm",
+                "banner "
+            ]
         );
     }
 
@@ -677,7 +714,7 @@ mod tests {
             streaming_host: false,
         };
         e.tick(at(20, 55), &[away], &mut fake);
-        assert!(fake.take().is_empty());
+        assert_eq!(fake.take(), ["banner "]);
     }
 
     #[test]
@@ -689,9 +726,9 @@ mod tests {
             fake.take(),
             [
                 "disable kid1",
-                "notify kid1: Computer time is over until 6:15am",
+                "notify kid1: Computer time is over until Tue 6:15am",
                 "lock 7",
-                "banner kid1: computer time is over until 6:15am",
+                "banner kid1: computer time is over until Tue 6:15am",
             ]
         );
         assert!(e.persisted.login_disabled.contains("kid1"));
@@ -794,7 +831,10 @@ mod tests {
         e.tick(at(15, 0), &[obs("kid1", false, running.clone())], &mut fake);
         assert_eq!(
             fake.take(),
-            ["notify kid1: 1 minute of games left today: save your game"]
+            [
+                "notify kid1: 1 minute of games left today: save your game",
+                "banner "
+            ]
         );
         // A minute of local play later
         e.count(
@@ -827,11 +867,18 @@ mod tests {
         let mut e = enforcer(vec![snap.clone()], at(20, 0));
         let mut fake = Fake::default();
         e.tick(at(20, 55), &[obs("kid1", false, vec![])], &mut fake);
-        assert_eq!(fake.take().len(), 1);
-        snap.day.stretches = vec![Stretch {
-            start_min: 375,
-            end_min: 1320,
-        }]; // until 10pm now
+        assert_eq!(fake.take().len(), 2); // the warning and the first banner
+        snap.week = vec![
+            DayRule {
+                restricted: true,
+                stretches: vec![Stretch {
+                    start_min: 375,
+                    end_min: 1320,
+                }], // until 10pm now
+                budgets: BTreeMap::new(),
+            };
+            7
+        ];
         e.apply_response(
             &ReportResponse {
                 server_time: at(20, 56),
@@ -867,7 +914,7 @@ mod tests {
             "20 + 10 minutes used up the 30"
         );
         fake.take();
-        // After midnight, without a new snapshot: yesterday's Monday rule doesn't apply to Tuesday
+        // After midnight, without a new snapshot: usage restarts, so nothing is closed
         let tuesday = day().succ_opt().unwrap();
         e.count("kid1", UserState::Active, &games, 15, tuesday);
         e.tick(
@@ -955,7 +1002,7 @@ mod tests {
             ],
             &mut fake,
         );
-        assert!(fake.take().is_empty());
+        assert_eq!(fake.take(), ["banner "]);
     }
 
     #[test]
@@ -1030,7 +1077,7 @@ mod tests {
         e.tick(morning, &[obs("kid1", true, vec![])], &mut fake);
         assert!(
             fake.calls.contains(&"enable kid1".to_string()),
-            "same weekday rule? no: unrestricted until the server answers"
+            "Tuesday's rule allows 6:15am, so the block lifts without the server"
         );
     }
 
@@ -1049,8 +1096,8 @@ mod tests {
         assert_eq!(
             fake.banner,
             [
-                "kid1: computer time is over until 6:15am",
-                "kid2: computer time is over until 6:15am"
+                "kid1: computer time is over until Tue 6:15am",
+                "kid2: computer time is over until Tue 6:15am"
             ]
         );
         fake.take();
@@ -1060,5 +1107,105 @@ mod tests {
             &mut fake,
         );
         assert!(!fake.calls.iter().any(|c| c.starts_with("banner")));
+    }
+
+    fn rule_from(start_min: u16, end_min: u16) -> DayRule {
+        DayRule {
+            restricted: true,
+            stretches: vec![Stretch { start_min, end_min }],
+            budgets: BTreeMap::new(),
+        }
+    }
+
+    fn tuesday(h: u32, m: u32) -> NaiveDateTime {
+        day().succ_opt().unwrap().and_hms_opt(h, m, 0).unwrap()
+    }
+
+    #[test]
+    fn blocked_at_night_stays_blocked_past_midnight() {
+        let mut e = enforcer(vec![snapshot("kid1", evenings())], at(20, 0));
+        let mut fake = Fake::default();
+        e.tick(at(21, 0), &[obs("kid1", false, vec![])], &mut fake);
+        fake.take();
+        e.tick(tuesday(0, 0), &[obs("kid1", true, vec![])], &mut fake);
+        e.tick(tuesday(0, 1), &[obs("kid1", true, vec![])], &mut fake);
+        // Only the banner's wording changes (the day name drops out once it is Tuesday)
+        assert_eq!(
+            fake.take(),
+            ["banner kid1: computer time is over until 6:15am"]
+        );
+        e.tick(tuesday(6, 15), &[obs("kid1", true, vec![])], &mut fake);
+        assert_eq!(fake.take(), ["enable kid1", "banner "]);
+    }
+
+    #[test]
+    fn warns_before_a_lock_at_midnight() {
+        let mut snap = snapshot("kid1", rule_from(375, 1440));
+        // Tuesday starts at 10am
+        snap.week[1] = rule_from(600, 1200);
+        let mut e = enforcer(vec![snap], at(23, 0));
+        let mut fake = Fake::default();
+        e.tick(at(23, 50), &[obs("kid1", false, vec![])], &mut fake);
+        assert_eq!(
+            fake.take(),
+            [
+                "notify kid1: 10 minutes left today: the computer locks at Tue 12:00am",
+                "banner "
+            ]
+        );
+        e.tick(tuesday(0, 0), &[obs("kid1", false, vec![])], &mut fake);
+        assert_eq!(
+            fake.take(),
+            [
+                "disable kid1",
+                "notify kid1: Computer time is over until 10:00am",
+                "lock 7",
+                "banner kid1: computer time is over until 10:00am"
+            ]
+        );
+    }
+
+    #[test]
+    fn offline_for_days_keeps_the_weekly_rules() {
+        let mut snap = snapshot("kid1", DayRule::default());
+        snap.week[1] = rule_from(600, 1200); // Tuesday 10am-8pm
+        let mut e = enforcer(vec![snap], at(12, 0));
+        let mut fake = Fake::default();
+        e.tick(tuesday(21, 0), &[obs("kid1", false, vec![])], &mut fake);
+        assert!(fake.calls.contains(&"disable kid1".to_string()));
+        assert!(
+            fake.calls
+                .contains(&"notify kid1: Computer time is over until Wed 12:00am".to_string())
+        );
+        let mut e = enforcer(
+            vec![{
+                let mut s = snapshot("kid1", DayRule::default());
+                s.week[1] = rule_from(600, 1200);
+                s
+            }],
+            at(12, 0),
+        );
+        let mut fake = Fake::default();
+        e.tick(tuesday(12, 0), &[obs("kid1", false, vec![])], &mut fake);
+        assert_eq!(fake.take(), ["banner "]);
+    }
+
+    #[test]
+    fn a_disable_that_took_effect_but_reported_failure_is_still_undone() {
+        let mut e = enforcer(vec![snapshot("kid1", evenings())], at(20, 0));
+        let mut fake = Fake {
+            fail_disable: true,
+            ..Default::default()
+        };
+        e.tick(at(21, 0), &[obs("kid1", true, vec![])], &mut fake);
+        assert!(e.persisted.login_disabled.contains("kid1"));
+        assert_eq!(
+            e.take_errors("kid1"),
+            ["disabling login failed: usermod said no"]
+        );
+        fake.take();
+        e.tick(tuesday(6, 15), &[obs("kid1", true, vec![])], &mut fake);
+        assert!(fake.calls.contains(&"enable kid1".to_string()));
+        assert!(e.persisted.login_disabled.is_empty());
     }
 }

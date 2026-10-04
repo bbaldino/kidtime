@@ -734,12 +734,11 @@ impl Db {
     }
 
     pub fn snapshot(&self, user: &str, now: NaiveDateTime) -> Result<protocol::AccountSnapshot> {
-        let weekday = now.date().weekday().num_days_from_monday() as u8;
         Ok(protocol::AccountSnapshot {
             user: user.to_string(),
             enforce: self.enforce(user)?,
             for_day: now.date(),
-            day: self.day_rule(user, weekday)?,
+            week: self.week_rules(user)?,
             blackouts: self.blackout_spans(user, now)?,
             used_secs: self.category_secs(user, now.date())?,
             games: self.app_ids_in(GAMES)?,
@@ -2023,7 +2022,8 @@ mod tests {
         let snap = db.snapshot("kid1", now).unwrap();
         assert!(snap.enforce);
         assert_eq!(snap.for_day, now.date());
-        assert_eq!(snap.day, rule);
+        assert_eq!(snap.week[weekday_today() as usize], rule);
+        assert_eq!(snap.week.len(), 7);
         assert_eq!(snap.used_secs[&GAMES], 15);
         assert_eq!(
             snap.blackouts
