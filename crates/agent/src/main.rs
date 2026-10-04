@@ -102,8 +102,22 @@ async fn main() -> Result<()> {
         let mut actions =
             actions::SystemActions::new(users_map, config.streaming_sway_socket.clone());
         let mut enforcer = enforce::Enforcer::new(load_state(&config.state_file));
-        enforcer.release_all(&mut actions);
+        let released = enforcer.release_all(&mut actions);
         save_state(&config.state_file, &enforcer.persisted)?;
+        let state = &enforcer.persisted;
+        if !state.login_disabled.is_empty() || !state.streams_blocked.is_empty() {
+            let list = |set: &std::collections::BTreeSet<String>| {
+                set.iter().cloned().collect::<Vec<_>>().join(", ")
+            };
+            bail!(
+                "could not undo everything: login still disabled for [{}], stream still blocked for [{}]",
+                list(&state.login_disabled),
+                list(&state.streams_blocked)
+            );
+        }
+        if !released {
+            bail!("could not clear the login screen banner");
+        }
         return Ok(());
     }
 
@@ -150,6 +164,9 @@ async fn main() -> Result<()> {
     // Instant uses CLOCK_MONOTONIC, which stops while the machine is suspended
     let mut last_tick = Instant::now();
     let mut seq = 0u64;
+    // systemd stops the agent with SIGTERM: exit between iterations, with the state saved
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("listening for SIGTERM")?;
 
     // One task: each arm runs to completion before the next tick is picked, and a sample tick
     // sends at most one batch, so enforcement waits at most one request (the client timeout).
@@ -211,7 +228,11 @@ async fn main() -> Result<()> {
                             tracing::debug!("reading the report response: {e}");
                             Default::default()
                         });
-                        if let Some(response) = parse_response(&body) {
+                        // The response resets the local count, so it only applies once the server has every
+                        // sample counted here; with a backlog, the reply to the last batch does
+                        if pending.is_empty()
+                            && let Some(response) = parse_response(&body)
+                        {
                             enforcer.apply_response(&response, Local::now().naive_local());
                             save_if_dirty(&mut enforcer, &config.state_file);
                         }
@@ -226,9 +247,13 @@ async fn main() -> Result<()> {
                 enforcer.tick(Local::now().naive_local(), &observations, &mut actions);
                 save_if_dirty(&mut enforcer, &config.state_file);
             }
-            _ = tokio::signal::ctrl_c() => return Ok(()),
+            _ = tokio::signal::ctrl_c() => break,
+            _ = sigterm.recv() => break,
         }
     }
+    tracing::info!("stopping");
+    save_if_dirty(&mut enforcer, &config.state_file);
+    Ok(())
 }
 
 /// The date the enforcer decides with: local time corrected by the server's clock, if ours is off.

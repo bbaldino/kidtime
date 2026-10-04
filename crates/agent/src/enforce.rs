@@ -91,6 +91,8 @@ pub struct Enforcer {
     pub persisted: Persisted,
     live: BTreeMap<String, Live>,
     banner: Option<Vec<String>>,
+    /// The last error setting the banner: a repeat is logged quietly, since it is retried every tick.
+    banner_error: Option<String>,
     dirty: bool,
 }
 
@@ -101,6 +103,7 @@ impl Enforcer {
             persisted,
             live: BTreeMap::new(),
             banner: None,
+            banner_error: None,
             dirty: false,
         }
     }
@@ -194,19 +197,35 @@ impl Enforcer {
         }
         if self.banner.as_ref() != Some(&banner) {
             match act.set_banner(&banner) {
-                Ok(()) => self.banner = Some(banner),
-                Err(e) => tracing::warn!("login screen banner: {e:#}"),
+                Ok(()) => {
+                    self.banner = Some(banner);
+                    self.banner_error = None;
+                }
+                Err(e) => {
+                    let text = format!("{e:#}");
+                    if self.banner_error.as_ref() == Some(&text) {
+                        tracing::debug!("login screen banner: {text}");
+                    } else {
+                        tracing::warn!("login screen banner: {text}");
+                        self.banner_error = Some(text);
+                    }
+                }
             }
         }
     }
 
-    pub fn release_all(&mut self, act: &mut dyn Actions) {
+    /// Whether everything was undone, the banner included. What could not be undone stays recorded.
+    pub fn release_all(&mut self, act: &mut dyn Actions) -> bool {
+        let mut ok = true;
         for user in self.persisted.login_disabled.clone() {
             match act.enable_login(&user) {
                 Ok(()) => {
                     self.persisted.login_disabled.remove(&user);
                 }
-                Err(e) => tracing::error!("re-enabling login for {user}: {e:#}"),
+                Err(e) => {
+                    ok = false;
+                    tracing::error!("re-enabling login for {user}: {e:#}");
+                }
             }
         }
         for user in self.persisted.streams_blocked.clone() {
@@ -214,13 +233,18 @@ impl Enforcer {
                 Ok(()) => {
                     self.persisted.streams_blocked.remove(&user);
                 }
-                Err(e) => tracing::error!("unblocking {user}'s stream: {e:#}"),
+                Err(e) => {
+                    ok = false;
+                    tracing::error!("unblocking {user}'s stream: {e:#}");
+                }
             }
         }
         if let Err(e) = act.set_banner(&[]) {
+            ok = false;
             tracing::error!("clearing the login screen banner: {e:#}");
         }
         self.dirty = true;
+        ok
     }
 
     pub fn overrun(&self, user: &str) -> Vec<String> {
@@ -287,11 +311,14 @@ impl Enforcer {
                 self.error(user, format!("lock failed: {e:#}"));
             }
         }
-        if o.streaming_host && !self.persisted.streams_blocked.contains(user) {
+        // Also on the first blocked tick of this process when already recorded: the nftables table
+        // does not survive a reboot (adding the rules is idempotent)
+        if o.streaming_host && (first || !self.persisted.streams_blocked.contains(user)) {
             match act.block_stream(user) {
                 Ok(()) => {
-                    self.persisted.streams_blocked.insert(user.clone());
-                    self.dirty = true;
+                    if self.persisted.streams_blocked.insert(user.clone()) {
+                        self.dirty = true;
+                    }
                 }
                 Err(e) => self.error(user, format!("cutting the stream failed: {e:#}")),
             }
@@ -533,6 +560,8 @@ mod tests {
         already_locked: BTreeSet<String>,
         fail_lock: bool,
         fail_disable: bool,
+        fail_enable: bool,
+        fail_banner: bool,
         banner: Vec<String>,
     }
 
@@ -558,6 +587,9 @@ mod tests {
         }
         fn enable_login(&mut self, user: &str) -> anyhow::Result<()> {
             self.calls.push(format!("enable {user}"));
+            if self.fail_enable {
+                anyhow::bail!("usermod said no");
+            }
             self.already_locked.remove(user);
             Ok(())
         }
@@ -578,6 +610,9 @@ mod tests {
         }
         fn set_banner(&mut self, lines: &[String]) -> anyhow::Result<()> {
             self.calls.push(format!("banner {}", lines.join(" | ")));
+            if self.fail_banner {
+                anyhow::bail!("dconf said no");
+            }
             self.banner = lines.to_vec();
             Ok(())
         }
@@ -1053,9 +1088,56 @@ mod tests {
         o.streaming_host = true;
         e.tick(at(21, 0), &[o], &mut fake);
         fake.take();
-        e.release_all(&mut fake);
+        assert!(e.release_all(&mut fake));
         assert_eq!(fake.take(), ["enable kid1", "unblock kid1", "banner "]);
         assert!(e.persisted.login_disabled.is_empty() && e.persisted.streams_blocked.is_empty());
+    }
+
+    #[test]
+    fn release_all_reports_what_it_could_not_undo() {
+        let mut e = enforcer(vec![snapshot("kid1", evenings())], at(20, 0));
+        let mut fake = Fake::default();
+        e.tick(at(21, 0), &[obs("kid1", true, vec![])], &mut fake);
+        fake.fail_enable = true;
+        assert!(!e.release_all(&mut fake));
+        assert!(e.persisted.login_disabled.contains("kid1"));
+    }
+
+    #[test]
+    fn a_stream_block_from_before_a_reboot_is_put_back() {
+        // The nftables table is gone after a reboot, but the state file still records the block
+        let mut e = enforcer(vec![snapshot("kid1", evenings())], at(20, 0));
+        e.persisted.streams_blocked.insert("kid1".into());
+        let saved = serde_json::to_string(&e.persisted).unwrap();
+        let mut e = Enforcer::new(serde_json::from_str(&saved).unwrap());
+        let mut fake = Fake::default();
+        let mut o = obs("kid1", true, vec![]);
+        o.streaming_host = true;
+        e.tick(at(21, 0), std::slice::from_ref(&o), &mut fake);
+        assert!(fake.take().contains(&"block kid1".to_string()));
+        e.tick(at(21, 1), &[o], &mut fake);
+        assert!(!fake.take().contains(&"block kid1".to_string()));
+        assert!(e.persisted.streams_blocked.contains("kid1"));
+    }
+
+    #[test]
+    fn a_repeated_banner_failure_is_remembered() {
+        let mut e = enforcer(vec![], at(20, 0));
+        let mut fake = Fake {
+            fail_banner: true,
+            ..Default::default()
+        };
+        e.tick(at(20, 0), &[], &mut fake);
+        assert_eq!(e.banner_error.as_deref(), Some("dconf said no"));
+        e.tick(at(20, 1), &[], &mut fake);
+        assert_eq!(
+            fake.take(),
+            ["banner ", "banner "],
+            "still retried every tick"
+        );
+        fake.fail_banner = false;
+        e.tick(at(20, 2), &[], &mut fake);
+        assert_eq!(e.banner_error, None);
     }
 
     #[test]
