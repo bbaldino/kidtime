@@ -94,4 +94,40 @@ impl Logind {
         }
         Ok(state)
     }
+
+    /// The user's graphical sessions on this PC, and whether each is locked.
+    #[allow(dead_code)] // Task 7 wires this into the enforcement loop
+    pub async fn graphical_sessions(
+        &self,
+        uid: u32,
+    ) -> zbus::Result<Vec<crate::enforce::SessionInfo>> {
+        let manager = ManagerProxy::new(&self.conn).await?;
+        let Ok(user_path) = manager.get_user(uid).await else {
+            return Ok(Vec::new());
+        };
+        let user = UserProxy::builder(&self.conn)
+            .path(user_path)?
+            .cache_properties(CacheProperties::No)
+            .build()
+            .await?;
+        let mut out = Vec::new();
+        for (id, path) in user.sessions().await? {
+            let session = SessionProxy::builder(&self.conn)
+                .path(path)?
+                .cache_properties(CacheProperties::No)
+                .build()
+                .await?;
+            // Sessions can disappear between listing and querying; skip those
+            let Ok(kind) = session.session_type().await else {
+                continue;
+            };
+            if GRAPHICAL_TYPES.contains(&kind.as_str()) && session.class().await? == "user" {
+                out.push(crate::enforce::SessionInfo {
+                    id,
+                    locked: session.locked_hint().await?,
+                });
+            }
+        }
+        Ok(out)
+    }
 }

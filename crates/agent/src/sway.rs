@@ -19,6 +19,11 @@ pub struct Window {
     /// Wayland app_id, or the X11 class for Xwayland windows.
     pub class: String,
     pub title: String,
+    #[allow(dead_code)] // Task 7 uses this to name the focused window's process
+    pub pid: u32,
+    /// Sway's container id, for closing this one window.
+    #[allow(dead_code)] // Task 7 uses this to close the focused window
+    pub con_id: i64,
 }
 
 /// The focused window, if Sway is reachable and a titled window has focus.
@@ -88,6 +93,8 @@ fn find_focused(node: &Value) -> Option<Window> {
         return Some(Window {
             class: class.to_string(),
             title: title.to_string(),
+            pid: node["pid"].as_u64().unwrap_or(0) as u32,
+            con_id: node["id"].as_i64().unwrap_or(0),
         });
     }
     ["nodes", "floating_nodes"]
@@ -107,12 +114,13 @@ mod tests {
             "type": "root", "nodes": [{ "type": "output", "nodes": [{ "type": "workspace", "nodes": [
                 { "type": "con", "pid": 1, "focused": false, "name": "Steam", "app_id": null,
                   "window_properties": { "class": "steam" } },
-                { "type": "con", "pid": 2, "focused": true, "name": "Heroes of the Storm", "app_id": null,
+                { "type": "con", "pid": 2, "focused": true, "id": 77, "name": "Heroes of the Storm", "app_id": null,
                   "window_properties": { "class": "steam_app_default" } }
             ]}]}]
         });
         let window = find_focused(&tree).unwrap();
         assert_eq!(window.title, "Heroes of the Storm");
+        assert_eq!((window.pid, window.con_id), (2, 77));
         let app = app_for(&window, |_| unreachable!());
         assert_eq!(
             (app.id.as_str(), app.name.as_str()),
@@ -132,11 +140,15 @@ mod tests {
         let steam = Window {
             class: "steam".into(),
             title: "Steam Big Picture Mode".into(),
+            pid: 0,
+            con_id: 0,
         };
         assert_eq!(app_for(&steam, |_| unreachable!()).id, "steam");
         let game = Window {
             class: "steam_app_1240440".into(),
             title: "Halo".into(),
+            pid: 0,
+            con_id: 0,
         };
         let app = app_for(&game, |id| format!("game {id}"));
         assert_eq!(

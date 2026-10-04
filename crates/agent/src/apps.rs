@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 
 use protocol::App;
 
+use crate::enforce::RunningApp;
+
 /// Launcher prefixes systemd scope names may carry before the app id.
 const LAUNCHERS: &[&str] = &["gnome", "flatpak", "kde", "KDE", "xdg"];
 
@@ -19,6 +21,9 @@ pub struct UserApps {
     /// Apps running inside one of the configured streaming units: the Steam
     /// client and the games it launched.
     pub streamed_apps: Vec<App>,
+    /// Every app in `apps` and `streamed_apps`, with its processes.
+    #[allow(dead_code)] // Task 7 wires this into the enforcement loop
+    pub running: Vec<RunningApp>,
 }
 
 #[derive(Default)]
@@ -39,7 +44,10 @@ impl Scanner {
         let mut result = UserApps {
             apps: Vec::new(),
             streamed_apps: Vec::new(),
+            running: Vec::new(),
         };
+        // Built once per scan, and only when a Steam game turns up
+        let mut parents: Option<HashMap<u32, u32>> = None;
         let root = PathBuf::from(format!("/sys/fs/cgroup/user.slice/user-{uid}.slice"));
         let mut stack = vec![root];
         while let Some(dir) = stack.pop() {
@@ -59,6 +67,15 @@ impl Scanner {
             if let Some(id) = parse_app_scope(dir_name)
                 && let Some(name) = self.desktop_name(&id, home)
             {
+                push_running(
+                    &mut result.running,
+                    RunningApp {
+                        id: id.clone(),
+                        name: name.clone(),
+                        pids: pids.clone(),
+                        window: None,
+                    },
+                );
                 push_unique(&mut result.apps, App { id, name });
             }
 
@@ -71,6 +88,16 @@ impl Scanner {
                         id: format!("steam:{appid}"),
                         name: self.steam_name(uid, home, appid, &program),
                     };
+                    let parents = parents.get_or_insert_with(process_parents);
+                    push_running(
+                        &mut result.running,
+                        RunningApp {
+                            id: game.id.clone(),
+                            name: game.name.clone(),
+                            pids: descendants(pid, parents),
+                            window: None,
+                        },
+                    );
                     if streaming {
                         push_unique(&mut result.streamed_apps, game.clone());
                     }
@@ -145,6 +172,51 @@ fn push_unique(apps: &mut Vec<App>, app: App) {
     if !apps.iter().any(|a| a.id == app.id || a.name == app.name) {
         apps.push(app);
     }
+}
+
+fn push_running(running: &mut Vec<RunningApp>, app: RunningApp) {
+    if !running.iter().any(|a| a.id == app.id) {
+        running.push(app);
+    }
+}
+
+/// The pid and every process below it.
+pub fn descendants(root: u32, parents: &HashMap<u32, u32>) -> Vec<u32> {
+    let mut out = vec![root];
+    let mut i = 0;
+    while i < out.len() {
+        let pid = out[i];
+        out.extend(
+            parents
+                .iter()
+                .filter(|&(_, &pp)| pp == pid)
+                .map(|(&p, _)| p),
+        );
+        i += 1;
+    }
+    out
+}
+
+fn parse_ppid(stat: &str) -> Option<u32> {
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
+}
+
+fn process_parents() -> HashMap<u32, u32> {
+    fs::read_dir("/proc")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let pid: u32 = e.file_name().to_str()?.parse().ok()?;
+            let ppid = parse_ppid(&fs::read_to_string(e.path().join("stat")).ok()?)?;
+            Some((pid, ppid))
+        })
+        .collect()
 }
 
 fn read_pids(cgroup: &Path) -> Vec<u32> {
@@ -326,6 +398,23 @@ mod tests {
         assert_eq!(
             parse_app_scope("app-dbus\\x2d:1.5\\x2dorg.a11y.atspi.Registry.slice"),
             None
+        );
+    }
+
+    #[test]
+    fn descendants_walks_the_whole_tree() {
+        let parents = HashMap::from([(2, 1), (3, 2), (4, 2), (5, 4), (9, 8)]);
+        let mut d = descendants(2, &parents);
+        d.sort_unstable();
+        assert_eq!(d, [2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn ppid_is_read_after_the_command_name() {
+        // The command name can contain spaces and parentheses
+        assert_eq!(
+            parse_ppid("1234 (Web Content (x)) S 99 1234 1234 0"),
+            Some(99)
         );
     }
 
