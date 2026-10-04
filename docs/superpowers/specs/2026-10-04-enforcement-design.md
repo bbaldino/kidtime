@@ -61,7 +61,7 @@ AccountSnapshot {
   used_secs: BTreeMap<CategoryId, i64>, // today's merged, cross-PC category time
   games: Vec<String>,                   // app ids in the Games category (the ones the agent may close)
   ignored: Vec<String>,                 // app ids in the Ignored category (never counted)
-  for_day: NaiveDate,                   // the day `day` and `used_secs` belong to
+  for_day: NaiveDate,                   // the day `used_secs` belongs to
 }
 ```
 
@@ -191,7 +191,8 @@ GDM settings file, the state file). The unit gains `StateDirectory=kidtime`. nft
 
 ## Error handling
 
-- Server unreachable: enforce from the saved snapshot. The dashboard shows the host offline as now.
+- Server unreachable: enforce from the saved snapshot. The dashboard shows the host offline as now. Time counted
+  locally since the last snapshot is lost if the agent restarts while the server is unreachable (an accepted undercount).
 - A lock, login change, firewall change or close fails: log it, retry on the next loop, and include it in the
   next report (`Sample` gains `errors: Vec<String>`), shown on the dashboard.
 - A notification fails: logged; enforcement proceeds on time.

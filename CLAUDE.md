@@ -115,6 +115,22 @@ A Cargo workspace (edition 2024) with three crates:
   - Untitled focused windows are ignored (Wine's hidden `explorer.exe` desktop).
   - This names games launched from other launchers (e.g. a game launched from Battle.net shows as the game,
     not Battle.net), and launchers left running in the background with no window don't count.
+- `enforce.rs`: the pure enforcement logic (`Enforcer`): it decides from the latest snapshot and the clock, and
+  calls an `Actions` trait. It records what it did in its persisted state, so everything can be undone.
+- `actions.rs`: the real actions: `loginctl` locks, `usermod -L/-U` (only for accounts the agent disabled;
+  passwordless accounts are never login-disabled and get a one-time log warning), notifications over D-Bus
+  (`gdbus`, as the kid), `swaymsg`/`swaynag` in streaming sessions, `kill` (SIGTERM, then SIGKILL after 10s),
+  `nft -f -` for table `inet kidtime`, and the GDM banner (`/etc/dconf/db/gdm.d/90-kidtime` plus `dconf`/`gsettings`).
+- Snapshot: the `/api/report` response is `ReportResponse { server_time, accounts: [AccountSnapshot { user,
+  enforce, for_day, week (7 rules, Monday first), blackouts, used_secs, games, ignored }] }`. The agent runs
+  the same `decide` as the server (it lives in `protocol`). An empty 204 means "no snapshot": enforce nothing.
+- State file `/var/lib/kidtime/agent-state.json` (mode 600; `state_file` in the agent config overrides it).
+  `--release-all` undoes everything recorded and exits non-zero if anything remains. The agent exits only
+  between loop iterations on SIGTERM/SIGINT, after saving. Enforcement runs every 5s.
+- Server side: `PUT /api/accounts/{user}/enforce`; `/api/status` users carry `enforce`, `overrun` and `errors`;
+  events carry `enforced` and `host`.
+- `deploy/install-agent.sh` also has `--stop-timekpr` and `--uninstall` (stops the agent, then `--release-all`;
+  removes nothing if that fails) and enables the GDM banner settings. `KIDTIME_INSTALL_ROOT` fakes the root.
 - `main.rs`: config, the sampling loop, and the decision logic, including the streaming override.
   - If the logind state doesn't count, the Sunshine check decides: `streaming` or `stream_idle`.
   - Streamed apps come from Sway focus when available, otherwise from the process scan.
@@ -207,6 +223,17 @@ Run `cargo test` (all pass) and `cargo clippy --all-targets` (clean). Tests cove
   defaults. Use `sudo target/debug/kidtime-agent --config dev/agent.dev.toml --dump` for the real view.
 - Gotcha: `pkill -f <pattern>` from the Bash tool can match its own shell. Use `pkill -x <name>`.
 
+## Enforcement spike findings (2026-10-04, spec: `docs/superpowers/specs/2026-10-04-enforcement-design.md`)
+
+- `swaynag --layer overlay --edge top` in the streaming Sway shows in Moonlight over Steam; over a fullscreen game is unconfirmed.
+- The desktop and the streaming session share one session bus and GNOME Shell receives its notifications, so plain notifications never reach a stream (hence swaynag).
+- `notify-send` isn't installed: notifications go straight to `org.freedesktop.Notifications.Notify` as the kid.
+- The GNOME lock screen shows only an icon for a notification, never its text.
+- GDM 50 runs each login screen as a temporary `gdm-greeter` user; the banner is set through that user's bus (found via `gnome-shell --mode=gdm`). Plain text only.
+- Sunshine's web API (2025.924) can't disconnect one client, and `/api/apps/close` closes Steam: not used.
+- Dropping traffic to the Sunshine ports with nftables (not from loopback) cuts Moonlight in about 5s, and removing the rule offers Resume with the session intact: used.
+- `loginctl lock-session` locks a background session, but the kid can unlock with their password, hence disabling login.
+
 ## Status
 
 - Verified on a real streaming host: session states, desktop app names, Steam and shortcut names,
@@ -217,7 +244,7 @@ Run `cargo test` (all pass) and `cargo clippy --all-targets` (clean). Tests cove
   by hand in a browser, including failed saves and loads with the server stopped. The start-up key fetch
   has only run in tests, never against a real identity provider. None of it is deployed. Session expiry behind the real proxy has not been tried.
 - Deployed 2026-10-02: the server container (image `0.1.0`) and the agent on both kid PCs, all reporting.
-  timekpr still enforces.
+  timekpr still enforces. Enforcement is built and covered by automated tests, but has not run on a real machine.
 
 ## Next steps
 
@@ -226,10 +253,10 @@ Run `cargo test` (all pass) and `cargo clippy --all-targets` (clean). Tests cove
 3. Run for a few days and check the numbers against reality.
 4. Then:
    - **dashboard auth**: done (the login check).
-   - **enforcement**: the rules, budgets and blackouts exist and are evaluated, but nothing acts on them.
-     Planned behaviour: a used-up budget closes that category's apps; the schedule or a blackout locks the
-     session. Still to do: "+30 min" / "lock now" from the phone, warnings via `notify-send` into the kid's
-     session, locking via logind `Session.Lock()`, and offline fallback in the agent. Then retire timekpr.
+   - **enforcement**: built (branch `enforcement`): warnings, lock plus login disabling, stream block, games
+     closing, banner, per-kid Enforce switch, `--release-all`, `--stop-timekpr`, `--uninstall`. Next: the
+     real-machine checklist (one kid, Enforce on for that kid only), then `--stop-timekpr` on both PCs.
+     After that: "+30 min" / "lock now" from the phone, and push notifications.
    - a **GNOME Shell extension** reporting the focused window over D-Bus. Desktop app time is currently
      "running while active" rather than focus. This also fixes a known gap: **non-Steam games on a GNOME
      desktop (e.g. Battle.net games) aren't detected at all** — no app scope and no SteamLaunch.

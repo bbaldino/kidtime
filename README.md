@@ -7,8 +7,8 @@ across machines. The results show up on a web dashboard that works on phones.
   records each tracked user's state and running apps, and sends that to the server.
 - **`kidtime-server`** stores usage in SQLite and serves the dashboard.
 
-This version tracks usage and holds the rules, but it doesn't enforce anything, so timekpr keeps
-handling schedules for now.
+It also enforces the rules, per kid, once you switch Enforce on for that kid (see "Enforcement").
+Until then it only reports, so timekpr can keep handling schedules.
 
 ## What counts as usage
 
@@ -99,7 +99,7 @@ The script asks for the agent token, checks the server and the token, writes
 `/etc/kidtime/agent.toml` (mode 600), installs the binary and the systemd unit, and
 shows what the agent sees. Add `--streaming` on a machine that hosts Sunshine
 streaming sessions, and `--host NAME` if the machine's hostname is unset. Run it again
-with no options to upgrade the binary. See `deploy/agent.toml.example` for all settings.
+with no options to upgrade the binary. `--stop-timekpr` and `--uninstall` are described under "Enforcement". See `deploy/agent.toml.example` for all settings.
 
 If the server can't be reached, the agent queues up to a day of samples and sends them later.
 
@@ -122,12 +122,51 @@ After that, use "Add to Home Screen" (iOS Safari) or "Install app" (Android Chro
 
 The dashboard has three tabs.
 
-- **Today** shows each kid's usage, what the rules say right now, and a log of what kidtime would have done.
-  Nothing is enforced on the computers yet.
+- **Today** shows each kid's usage, what the rules say right now, an **Enforce** switch per kid, and a log of
+  what kidtime did (or would have done, while Enforce is off).
 - **Rules** sets, per kid and per weekday, the allowed hours and a games budget, plus one-off blackouts.
   "Copy this week to" replaces another kid's whole week with the one shown (blackouts are not copied).
 - **Apps** lists every app seen and its category. Games and uncategorised apps use the games budget; move apps
   you don't care about to **Ignored** to hide them from Today and stop them counting.
+
+## Enforcement
+
+Each kid has an **Enforce** switch on the Today tab. It is off by default, and while it is off the agents only
+report. Turning it on is picked up within one report cycle.
+
+With it on, each agent decides locally every 5 seconds, from the latest rules the server sent. So it
+keeps enforcing if the server is down or the PC is offline (the rules are saved on the PC). What happens:
+
+- **Warnings** at 10, 5 and 1 minute before allowed hours end or a blackout starts, and before the games
+  budget runs out. They show on the desktop and in a Moonlight stream.
+- **At the end of allowed time or a blackout:** the session is locked and the account's login is disabled
+  (`usermod -L`), so the lock can't be unlocked with a password. It is re-enabled when allowed time
+  returns. An account that has no password can't have its login disabled; it gets the session lock only,
+  and a one-time warning in the agent's log. An account that was already locked is never unlocked.
+- **Streams are cut:** traffic to the kid's Sunshine ports is dropped (an nftables table, `inet kidtime`),
+  so Moonlight disconnects within seconds and can't reconnect. Afterwards the stream can be resumed.
+- **Games budget used up:** apps in the Games category are closed (SIGTERM, then SIGKILL after 10 seconds)
+  and kept closed. Apps that aren't categorised count toward the budget but are never closed; they show on
+  the dashboard instead.
+- **Login screen:** while anyone is blocked, a banner shows one line per blocked kid.
+
+The agent keeps what it changed in `/var/lib/kidtime/agent-state.json` (mode 600, `state_file` in the agent
+config overrides it), so blocks survive a reboot or an agent restart and are undone later.
+The dashboard shows what enforcement did, and any action that failed (it is retried every loop).
+
+**Retiring timekpr:** once you trust kidtime, run `sudo deploy/install-agent.sh --stop-timekpr` on each PC.
+
+**Recovery.** If the agent stops for good while a kid is blocked, or something goes wrong:
+
+```sh
+sudo /usr/local/bin/kidtime-agent --config /etc/kidtime/agent.toml --release-all   # undo everything it recorded
+sudo usermod -U <kid>                  # re-enable a login by hand
+sudo nft delete table inet kidtime     # remove the stream block by hand
+```
+
+`--release-all` exits non-zero if anything remains. `sudo deploy/install-agent.sh --uninstall` stops the
+agent, runs `--release-all`, and only if that succeeds removes the unit, binary, config and state.
+Turning Enforce off for a kid also releases everything within one report cycle.
 
 ## Who can see and change things
 
@@ -144,5 +183,4 @@ that token itself, so reaching its port directly doesn't get around the login. T
   goes up only while it's encoding a stream. This needs root. If the counter
   can't be read, streamed games count as usage.
 - **Focus tracking:** a GNOME Shell extension that reports the focused app over D-Bus.
-- **Enforcement:** the rules are stored and evaluated, but nothing acts on them yet. Next: closing apps
-  and locking sessions, and "+30 min" from the dashboard, to replace timekpr.
+- **Enforcement:** next are "+30 min" and "lock now" from the dashboard, and phone notifications.

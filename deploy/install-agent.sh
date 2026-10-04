@@ -11,6 +11,9 @@
 #   --streaming        this machine hosts Sunshine streaming sessions
 #   --binary PATH      default: target/release/kidtime-agent in this checkout
 #   --token-file FILE  read the agent token from FILE instead of asking for it
+#   --stop-timekpr     stop and disable timekpr's service on this machine, then exit
+#   --uninstall        undo what the agent enforced (--release-all), then remove the agent,
+#                      its config and its state, and exit
 #
 # The token is asked for without echo and only written to /etc/kidtime/agent.toml
 # (mode 600). Running it again with no options upgrades the binary and keeps the
@@ -23,7 +26,7 @@ REPO=$(cd "$(dirname "$0")/.." && pwd)
 ROOT=${KIDTIME_INSTALL_ROOT:-}
 CONFIG=$ROOT/etc/kidtime/agent.toml
 
-server= users= host= streaming=no token_file=
+server= users= host= streaming=no token_file= stop_timekpr=no uninstall=no
 binary=$REPO/target/release/kidtime-agent
 while [ $# -gt 0 ]; do
   case $1 in
@@ -33,6 +36,8 @@ while [ $# -gt 0 ]; do
     --streaming) streaming=yes; shift ;;
     --binary) binary=${2:?--binary needs a path}; shift 2 ;;
     --token-file) token_file=${2:?--token-file needs a path}; shift 2 ;;
+    --stop-timekpr) stop_timekpr=yes; shift ;;
+    --uninstall) uninstall=yes; shift ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
 done
@@ -40,6 +45,67 @@ done
 fail() { echo "error: $*" >&2; exit 1; }
 
 [ -n "$ROOT" ] || [ "$(id -u)" = 0 ] || fail "run this with sudo"
+
+if [ "$stop_timekpr" = yes ]; then
+  if [ -n "$ROOT" ]; then
+    echo "would run: systemctl disable --now timekpr.service"
+  else
+    echo "== stopping timekpr"
+    if systemctl cat timekpr.service >/dev/null 2>&1; then
+      systemctl disable --now timekpr.service
+      echo "timekpr.service: $(systemctl is-active timekpr.service || true), $(systemctl is-enabled timekpr.service || true)"
+    else
+      echo "timekpr.service not found; nothing to stop"
+    fi
+  fi
+  exit 0
+fi
+
+if [ "$uninstall" = yes ]; then
+  bin=$ROOT/usr/local/bin/kidtime-agent
+  if [ -n "$ROOT" ]; then
+    echo "would run: systemctl stop kidtime-agent.service (so it can't re-apply blocks)"
+  else
+    echo "== stopping the agent"
+    systemctl stop kidtime-agent.service 2>/dev/null || true
+  fi
+  if [ -e "$bin" ]; then
+    if [ -n "$ROOT" ]; then
+      echo "would run: $bin --config $CONFIG --release-all"
+    else
+      echo "== releasing everything the agent enforced"
+      if ! out=$("$bin" --config "$CONFIG" --release-all 2>&1); then
+        echo "$out" >&2
+        cat >&2 <<'MSG'
+
+error: the agent could not undo everything. Nothing was removed, so this can be retried.
+To recover by hand:
+  sudo usermod -U <kid>             # for each kid whose login is disabled
+  sudo nft delete table inet kidtime
+  (the login-screen banner: delete /etc/dconf/db/gdm.d/90-kidtime, then run: sudo dconf update)
+MSG
+        exit 1
+      fi
+      [ -z "$out" ] || echo "$out"
+    fi
+  else
+    echo "no agent binary at $bin; skipping --release-all"
+  fi
+  if [ -n "$ROOT" ]; then
+    echo "would run: systemctl disable --now kidtime-agent.service"
+    echo "would remove: $ROOT/etc/systemd/system/kidtime-agent.service $bin $ROOT/etc/kidtime $ROOT/var/lib/kidtime"
+    echo "would run: systemctl daemon-reload"
+  else
+    echo "== removing the agent"
+    systemctl disable --now kidtime-agent.service 2>/dev/null || true
+    rm -f /etc/systemd/system/kidtime-agent.service "$bin"
+    rm -rf /etc/kidtime /var/lib/kidtime
+    systemctl daemon-reload
+    echo "removed the unit, /usr/local/bin/kidtime-agent, /etc/kidtime and /var/lib/kidtime"
+  fi
+  exit 0
+fi
+
 [ -x "$binary" ] || fail "no agent binary at $binary. Build it first: cargo build --release -p agent"
 
 write_config=yes
@@ -95,6 +161,14 @@ fi
 install -D -m 755 "$binary" "$ROOT/usr/local/bin/kidtime-agent"
 install -D -m 644 "$REPO/deploy/kidtime-agent.service" "$ROOT/etc/systemd/system/kidtime-agent.service"
 echo "installed /usr/local/bin/kidtime-agent and the systemd unit"
+
+# Later login screens should read kidtime's banner settings (the agent writes them into gdm.d).
+if [ -z "$ROOT" ] && [ -e /usr/share/dconf/profile/gdm ] && [ ! -e /etc/dconf/profile/gdm ]; then
+  install -d /etc/dconf/profile /etc/dconf/db/gdm.d
+  { echo "user-db:user"; echo "system-db:gdm"; grep -v '^user-db:' /usr/share/dconf/profile/gdm; } > /etc/dconf/profile/gdm
+  dconf update
+  echo "enabled login-screen banner settings (/etc/dconf/profile/gdm)"
+fi
 
 [ -z "$ROOT" ] || exit 0
 
