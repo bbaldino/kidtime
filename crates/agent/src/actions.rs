@@ -13,10 +13,29 @@ const DEFAULT_SUNSHINE_PORT: u16 = 47989;
 const KILL_AFTER: Duration = Duration::from_secs(10);
 const DCONF_FILE: &str = "/etc/dconf/db/gdm.d/90-kidtime";
 
-pub fn shadow_locked(shadow: &str, user: &str) -> Option<bool> {
+#[derive(Debug, PartialEq, Eq)]
+pub enum ShadowState {
+    /// The hash starts with `!`: password login is off.
+    Locked,
+    Unlocked,
+    /// An empty hash: locking would make the account impossible to unlock again.
+    NoPassword,
+}
+
+pub fn shadow_state(shadow: &str, user: &str) -> Option<ShadowState> {
     shadow.lines().find_map(|l| {
         let mut f = l.split(':');
-        (f.next()? == user).then(|| f.next().is_some_and(|hash| hash.starts_with('!')))
+        if f.next()? != user {
+            return None;
+        }
+        let hash = f.next()?;
+        Some(if hash.is_empty() {
+            ShadowState::NoPassword
+        } else if hash.starts_with('!') {
+            ShadowState::Locked
+        } else {
+            ShadowState::Unlocked
+        })
     })
 }
 
@@ -58,13 +77,38 @@ pub fn gvariant_string(s: &str) -> String {
     format!("'{escaped}'")
 }
 
-/// Run through `swaymsg exec`, which hands the string to `sh -c`: quote it for the shell, one line.
+/// Run through `swaymsg exec`: sway's parser and then `sh -c` both see the string. Make the text
+/// inert for both: no backslash, no single quote, no line breaks, so the one pair of quotes holds.
 pub fn swaynag_command(text: &str) -> String {
-    let one_line = text.replace('\n', " ");
-    format!(
-        "swaynag --layer overlay --edge top -t warning -m '{}'",
-        one_line.replace('\'', r"'\''")
-    )
+    let inert: String = text
+        .chars()
+        .map(|c| match c {
+            '\\' => '/',
+            '\'' => '\u{2019}',
+            '\n' | '\r' => ' ',
+            c => c,
+        })
+        .collect();
+    format!("swaynag --layer overlay --edge top -t warning -m '{inert}'")
+}
+
+/// Commands for `nft -f -`, one per line.
+pub fn nft_script(lines: &[String]) -> String {
+    let mut script = lines.join("\n");
+    script.push('\n');
+    script
+}
+
+/// Pids that are safe to signal: never init, never anything that would wrap to a group or "all".
+fn signalable(pid: u32) -> bool {
+    pid > 1 && pid <= i32::MAX as u32
+}
+
+/// `gnome-shell --mode=gdm` itself, not a shell that merely mentions it.
+fn is_gdm_greeter(argv: &[&str]) -> bool {
+    argv.first()
+        .is_some_and(|a| a.rsplit('/').next() == Some("gnome-shell"))
+        && argv.contains(&"--mode=gdm")
 }
 
 pub fn dconf_keyfile(lines: &[String]) -> String {
@@ -88,6 +132,28 @@ fn run(program: &str, args: &[&str]) -> Result<()> {
             args.join(" "),
             String::from_utf8_lossy(&out.stderr).trim()
         );
+    }
+    Ok(())
+}
+
+fn run_stdin(program: &str, args: &[&str], input: &str) -> Result<()> {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("running {program}"))?;
+    child
+        .stdin
+        .take()
+        .context("no stdin")?
+        .write_all(input.as_bytes())?;
+    let out = child.wait_with_output()?;
+    if !out.status.success() {
+        bail!("{program}: {}", String::from_utf8_lossy(&out.stderr).trim());
     }
     Ok(())
 }
@@ -150,10 +216,17 @@ impl Actions for SystemActions {
 
     fn login_disabled(&mut self, user: &str) -> Result<bool> {
         let shadow = std::fs::read_to_string("/etc/shadow").context("reading /etc/shadow")?;
-        shadow_locked(&shadow, user).with_context(|| format!("{user} not in /etc/shadow"))
+        match shadow_state(&shadow, user).with_context(|| format!("{user} not in /etc/shadow"))? {
+            ShadowState::Locked => Ok(true),
+            ShadowState::Unlocked | ShadowState::NoPassword => Ok(false),
+        }
     }
 
     fn disable_login(&mut self, user: &str) -> Result<()> {
+        let shadow = std::fs::read_to_string("/etc/shadow").context("reading /etc/shadow")?;
+        if shadow_state(&shadow, user) == Some(ShadowState::NoPassword) {
+            bail!("{user} has no password; not disabling login, the session lock still applies");
+        }
         run("usermod", &["-L", user])
     }
 
@@ -205,6 +278,9 @@ impl Actions for SystemActions {
             let _ = run("swaymsg", &["-s", &w.socket.to_string_lossy(), &criteria]);
         }
         let now = Instant::now();
+        // A close round hours later must start over with SIGTERM
+        self.closing
+            .retain(|_, since| now.duration_since(*since) < KILL_AFTER * 2);
         for &pid in &app.pids {
             let signal = match self.closing.get(&pid) {
                 Some(&since) if now.duration_since(since) >= KILL_AFTER => libc_kill(pid, 9),
@@ -229,21 +305,35 @@ impl Actions for SystemActions {
             .users
             .get(user)
             .with_context(|| format!("{user} is not tracked"))?;
-        let conf = std::fs::read_to_string(home.join(".config/sunshine/sunshine.conf"))
-            .unwrap_or_default();
-        // Rules left from before an agent restart must not be doubled up
-        let tag = format!("comment \"{user}\"");
-        let already = list_kidtime_table()?
-            .is_some_and(|t| t.lines().any(|l| l.contains("drop") && l.contains(&tag)));
-        for cmd in nft_block_commands(user, sunshine_port(&conf)) {
-            if already && cmd.starts_with("add rule") {
-                continue;
+        let conf_path = home.join(".config/sunshine/sunshine.conf");
+        let conf = match std::fs::read_to_string(&conf_path) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(
+                    "{}: {e}; blocking the default Sunshine port range for {user}",
+                    conf_path.display()
+                );
+                String::new()
             }
-            // `add table` and `add chain` are idempotent
-            let args: Vec<&str> = cmd.split(' ').collect();
-            run("nft", &args)?;
-        }
-        Ok(())
+        };
+        // Rules left from before an agent restart must not be doubled up: add only the missing ones
+        let tag = format!("comment \"{user}\"");
+        let table = list_kidtime_table()?.unwrap_or_default();
+        let has_rule = |proto: &str| {
+            let dport = format!("{proto} dport");
+            table
+                .lines()
+                .any(|l| l.contains(&dport) && l.contains("drop") && l.contains(&tag))
+        };
+        let lines: Vec<String> = nft_block_commands(user, sunshine_port(&conf))
+            .into_iter()
+            .filter(|c| {
+                !(c.contains("tcp dport") && has_rule("tcp")
+                    || c.contains("udp dport") && has_rule("udp"))
+            })
+            .collect();
+        // Over stdin: argv would treat the negative priority as an option, and it applies atomically
+        run_stdin("nft", &["-f", "-"], &nft_script(&lines))
     }
 
     fn unblock_stream(&mut self, user: &str) -> Result<()> {
@@ -274,9 +364,14 @@ impl Actions for SystemActions {
         if std::path::Path::new("/etc/dconf/db/gdm.d").is_dir() {
             std::fs::write(DCONF_FILE, dconf_keyfile(lines))?;
             run("dconf", &["update"])?;
+        } else {
+            tracing::warn!(
+                "/etc/dconf/db/gdm.d is missing: banner for later login screens skipped"
+            );
         }
-        // The login screen running now: as its temporary user, over its session bus
-        if let Some((uid, gid)) = greeter_ids() {
+        // The login screens running now: as their temporary users, over their session buses
+        let mut first_error = None;
+        for (uid, gid) in greeter_ids() {
             let env = [
                 format!("XDG_RUNTIME_DIR=/run/user/{uid}"),
                 format!("DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus"),
@@ -298,36 +393,53 @@ impl Actions for SystemActions {
                 args.extend_from_slice(extra);
                 run("setpriv", &args)
             };
-            if lines.is_empty() {
-                base(&["banner-message-enable", "false"])?;
+            let result = if lines.is_empty() {
+                base(&["banner-message-enable", "false"])
             } else {
-                base(&["banner-message-text", &lines.join("\n")])?;
-                base(&["banner-message-enable", "true"])?;
+                // gsettings takes a GVariant, so a bare string with quotes or a leading digit is not safe
+                base(&["banner-message-text", &gvariant_string(&lines.join("\n"))])
+                    .and_then(|()| base(&["banner-message-enable", "true"]))
+            };
+            if let Err(e) = result {
+                first_error.get_or_insert(e);
             }
         }
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 }
 
-/// uid and gid of the process running the login screen (`gnome-shell --mode=gdm`), if one is running.
-fn greeter_ids() -> Option<(u32, u32)> {
-    std::fs::read_dir("/proc").ok()?.flatten().find_map(|e| {
-        let cmdline = std::fs::read(e.path().join("cmdline")).ok()?;
-        let args = String::from_utf8_lossy(&cmdline).replace('\0', " ");
-        if !args.contains("gnome-shell") || !args.contains("--mode=gdm") {
-            return None;
-        }
-        let status = std::fs::read_to_string(e.path().join("status")).ok()?;
-        let id = |key: &str| {
-            status
-                .lines()
-                .find_map(|l| l.strip_prefix(key)?.split_whitespace().next()?.parse().ok())
-        };
-        Some((id("Uid:")?, id("Gid:")?))
-    })
+/// uid and gid of every process running a login screen (`gnome-shell --mode=gdm`), never root.
+fn greeter_ids() -> Vec<(u32, u32)> {
+    let Ok(dir) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    dir.flatten()
+        .filter_map(|e| {
+            let cmdline = std::fs::read(e.path().join("cmdline")).ok()?;
+            let argv: Vec<String> = cmdline
+                .split(|&b| b == 0)
+                .map(|a| String::from_utf8_lossy(a).into_owned())
+                .collect();
+            let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+            if !is_gdm_greeter(&argv) {
+                return None;
+            }
+            let status = std::fs::read_to_string(e.path().join("status")).ok()?;
+            let id = |key: &str| {
+                status
+                    .lines()
+                    .find_map(|l| l.strip_prefix(key)?.split_whitespace().next()?.parse().ok())
+            };
+            let (uid, gid) = (id("Uid:")?, id("Gid:")?);
+            (uid != 0).then_some((uid, gid))
+        })
+        .collect()
 }
 
 fn libc_kill(pid: u32, signal: i32) -> Result<()> {
+    if !signalable(pid) {
+        bail!("refusing to signal pid {pid}");
+    }
     run("kill", &[&format!("-{signal}"), &pid.to_string()])
 }
 
@@ -337,10 +449,13 @@ mod tests {
 
     #[test]
     fn shadow_lock_state() {
-        let shadow = "root:$6$abc:1::::::\nkid1:!$6$def:1::::::\nkid2:$6$ghi:1::::::\n";
-        assert_eq!(shadow_locked(shadow, "kid1"), Some(true));
-        assert_eq!(shadow_locked(shadow, "kid2"), Some(false));
-        assert_eq!(shadow_locked(shadow, "nobody"), None);
+        let shadow = "root:$6$abc:1::::::\nkid1:!$6$def:1::::::\nkid2:$6$ghi:1::::::\nkid3::1::::::\nkid4:!!:1::::::\nkid5:*:1::::::\n";
+        assert_eq!(shadow_state(shadow, "kid1"), Some(ShadowState::Locked));
+        assert_eq!(shadow_state(shadow, "kid2"), Some(ShadowState::Unlocked));
+        assert_eq!(shadow_state(shadow, "kid3"), Some(ShadowState::NoPassword));
+        assert_eq!(shadow_state(shadow, "kid4"), Some(ShadowState::Locked));
+        assert_eq!(shadow_state(shadow, "kid5"), Some(ShadowState::Unlocked));
+        assert_eq!(shadow_state(shadow, "nobody"), None);
     }
 
     #[test]
@@ -383,5 +498,52 @@ mod tests {
             "[org/gnome/login-screen]\nbanner-message-enable=false\n"
         );
         assert!(dconf_keyfile(&["a'b".into()]).contains("banner-message-text='a\\'b'"));
+    }
+
+    #[test]
+    fn swaynag_text_is_inert_for_sway_and_sh() {
+        let text = "a\\b \\';exec foo;' x, $(id)\n-y\r";
+        let cmd = swaynag_command(text);
+        let prefix = "swaynag --layer overlay --edge top -t warning -m ";
+        let arg = cmd.strip_prefix(prefix).unwrap();
+        assert!(arg.starts_with('\'') && arg.ends_with('\''));
+        let inner = &arg[1..arg.len() - 1];
+        assert!(!inner.contains(['\\', '\'', '\n', '\r']));
+        assert!(inner.contains("$(id)") && inner.contains("-y"));
+    }
+
+    #[test]
+    fn nft_script_is_one_command_per_line() {
+        let script = nft_script(&[
+            "add table inet kidtime".into(),
+            "add chain x { priority -10 ; }".into(),
+        ]);
+        assert_eq!(
+            script,
+            "add table inet kidtime\nadd chain x { priority -10 ; }\n"
+        );
+    }
+
+    #[test]
+    fn only_real_pids_are_signalable() {
+        assert!(!signalable(0));
+        assert!(!signalable(1));
+        assert!(signalable(2));
+        assert!(signalable(i32::MAX as u32));
+        assert!(!signalable(i32::MAX as u32 + 1));
+        assert!(libc_kill(1, 15).is_err());
+    }
+
+    #[test]
+    fn greeter_argv_is_matched_exactly() {
+        assert!(is_gdm_greeter(&[
+            "/usr/bin/gnome-shell",
+            "--mode=gdm",
+            "--wayland"
+        ]));
+        assert!(is_gdm_greeter(&["gnome-shell", "--mode=gdm"]));
+        assert!(!is_gdm_greeter(&["/usr/bin/gnome-shell", "--mode=user"]));
+        assert!(!is_gdm_greeter(&["sh", "-c", "gnome-shell --mode=gdm"]));
+        assert!(!is_gdm_greeter(&[]));
     }
 }
