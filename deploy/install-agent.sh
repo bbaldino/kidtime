@@ -13,7 +13,8 @@
 #   --token-file FILE  read the agent token from FILE instead of asking for it
 #   --stop-timekpr     stop and disable timekpr's service on this machine, then exit
 #   --uninstall        undo what the agent enforced (--release-all), then remove the agent,
-#                      its config and its state, and exit
+#                      its config and its state, and the login-screen banner settings
+#                      (the GDM profile override only if this script wrote it), and exit
 #
 # The token is asked for without echo and only written to /etc/kidtime/agent.toml
 # (mode 600). Running it again with no options upgrades the binary and keeps the
@@ -44,6 +45,15 @@ done
 
 fail() { echo "error: $*" >&2; exit 1; }
 
+# The first line of a GDM dconf profile this script wrote, so --uninstall removes only its own.
+KIDTIME_MARK="# written by kidtime"
+GDM_PROFILE=$ROOT/etc/dconf/profile/gdm
+GDM_KEYFILE=$ROOT/etc/dconf/db/gdm.d/90-kidtime
+
+dconf_update() {
+  if [ -n "$ROOT" ]; then echo "would run: dconf update"; else dconf update; fi
+}
+
 [ -n "$ROOT" ] || [ "$(id -u)" = 0 ] || fail "run this with sudo"
 
 if [ "$stop_timekpr" = yes ]; then
@@ -71,6 +81,7 @@ To recover by hand (stop the agent first, or it undoes these within seconds):
   sudo usermod -U <kid>             # for each kid whose login is disabled
   sudo nft delete table inet kidtime
   sudo rm -f /etc/dconf/db/gdm.d/90-kidtime && sudo dconf update   # the login-screen banner
+  # and /etc/dconf/profile/gdm, if its first line is "# written by kidtime"
 MSG
   }
   if [ -n "$ROOT" ]; then
@@ -104,6 +115,23 @@ MSG
     exit 1
   else
     echo "no agent binary at $bin and no state file; skipping --release-all"
+  fi
+  # The login-screen banner settings: the agent's file, and the profile override only if this script wrote it
+  banner_files=()
+  [ ! -e "$GDM_KEYFILE" ] || banner_files+=("$GDM_KEYFILE")
+  if [ -f "$GDM_PROFILE" ] && grep -qxF "$KIDTIME_MARK" "$GDM_PROFILE"; then
+    banner_files+=("$GDM_PROFILE")
+  elif [ -e "$GDM_PROFILE" ]; then
+    echo "leaving $GDM_PROFILE: kidtime didn't write it"
+  fi
+  if [ ${#banner_files[@]} -gt 0 ]; then
+    if [ -n "$ROOT" ]; then
+      echo "would remove: ${banner_files[*]}"
+    else
+      rm -f "${banner_files[@]}"
+      echo "removed ${banner_files[*]}"
+    fi
+    dconf_update || echo "warning: dconf update failed" >&2
   fi
   if [ -n "$ROOT" ]; then
     echo "would run: systemctl disable --now kidtime-agent.service"
@@ -177,21 +205,21 @@ install -D -m 644 "$REPO/deploy/kidtime-agent.service" "$ROOT/etc/systemd/system
 echo "installed /usr/local/bin/kidtime-agent and the systemd unit"
 
 # Later login screens should read kidtime's banner settings (the agent writes them into gdm.d).
-# The banner is optional: a failure here must not abort the install.
-if [ -z "$ROOT" ] && [ -e /usr/share/dconf/profile/gdm ] && [ ! -e /etc/dconf/profile/gdm ]; then
-  if (
-    set -e
-    tmp=$(mktemp /etc/dconf/profile.gdm.XXXXXX 2>/dev/null || mktemp)
-    trap 'rm -f "$tmp"' EXIT
-    install -d /etc/dconf/profile /etc/dconf/db/gdm.d
-    { echo "user-db:user"; echo "system-db:gdm"; grep -v '^user-db:' /usr/share/dconf/profile/gdm || true; } > "$tmp"
-    chmod 644 "$tmp"
-    mv "$tmp" /etc/dconf/profile/gdm
-    dconf update
-  ); then
+# The banner is optional: a failure here must not abort the install. Each step is chained with &&
+# (set -e does nothing inside an if condition), so any failure takes the else branch.
+stock_profile=$ROOT/usr/share/dconf/profile/gdm
+if [ -e "$stock_profile" ] && [ ! -e "$GDM_PROFILE" ]; then
+  tmp=
+  if install -d "$ROOT/etc/dconf/profile" "$ROOT/etc/dconf/db/gdm.d" &&
+    tmp=$(mktemp "$ROOT/etc/dconf/profile/.gdm.XXXXXX") &&
+    { echo "$KIDTIME_MARK"; echo "user-db:user"; echo "system-db:gdm"; grep -v '^user-db:' "$stock_profile" || true; } > "$tmp" &&
+    chmod 644 "$tmp" &&
+    mv "$tmp" "$GDM_PROFILE" &&
+    dconf_update; then
     echo "enabled login-screen banner settings (/etc/dconf/profile/gdm)"
   else
-    rm -f /etc/dconf/profile/gdm
+    [ -z "$tmp" ] || rm -f "$tmp"
+    rm -f "$GDM_PROFILE"
     echo "warning: could not enable the login-screen banner settings; continuing without them" >&2
   fi
 fi
