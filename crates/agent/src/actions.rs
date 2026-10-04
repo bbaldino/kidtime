@@ -1,6 +1,6 @@
 //! The real enforcement actions: commands and signals, run as root.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -11,6 +11,8 @@ use crate::enforce::{Actions, RunningApp};
 
 const DEFAULT_SUNSHINE_PORT: u16 = 47989;
 const KILL_AFTER: Duration = Duration::from_secs(10);
+/// A pid not passed to `close` for this long is no longer being closed: start over with SIGTERM.
+const CLOSING_STALE_AFTER: Duration = Duration::from_secs(30);
 const DCONF_FILE: &str = "/etc/dconf/db/gdm.d/90-kidtime";
 
 #[derive(Debug, PartialEq, Eq)]
@@ -90,6 +92,38 @@ pub fn swaynag_command(text: &str) -> String {
         })
         .collect();
     format!("swaynag --layer overlay --edge top -t warning -m '{inert}'")
+}
+
+/// Where a pid is in being closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Closing {
+    first_term: Instant,
+    last_seen: Instant,
+}
+
+/// The signal to send now (15 first, 9 once `KILL_AFTER` has passed since the first, however far
+/// apart the calls are) and the updated entry. An entry not seen for `CLOSING_STALE_AFTER` is
+/// forgotten, so a round much later starts with SIGTERM again.
+fn signal_for(entry: Option<Closing>, now: Instant) -> (Option<i32>, Closing) {
+    match entry.filter(|e| now.duration_since(e.last_seen) < CLOSING_STALE_AFTER) {
+        None => (
+            Some(15),
+            Closing {
+                first_term: now,
+                last_seen: now,
+            },
+        ),
+        Some(e) => {
+            let signal = (now.duration_since(e.first_term) >= KILL_AFTER).then_some(9);
+            (
+                signal,
+                Closing {
+                    last_seen: now,
+                    ..e
+                },
+            )
+        }
+    }
 }
 
 /// Commands for `nft -f -`, one per line.
@@ -175,7 +209,9 @@ pub struct SystemActions {
     users: HashMap<String, (u32, PathBuf)>,
     streaming_sway_socket: Option<String>,
     /// Processes sent SIGTERM, and when.
-    closing: HashMap<u32, Instant>,
+    closing: HashMap<u32, Closing>,
+    /// Accounts already warned about having no password.
+    warned_no_password: HashSet<String>,
 }
 
 impl SystemActions {
@@ -188,6 +224,7 @@ impl SystemActions {
             users,
             streaming_sway_socket,
             closing: HashMap::new(),
+            warned_no_password: HashSet::new(),
         }
     }
 
@@ -214,11 +251,20 @@ impl Actions for SystemActions {
         run("loginctl", &["lock-session", session_id])
     }
 
+    /// An account with no password reports `true` ("already disabled"): locking it would make it
+    /// impossible to unlock again, and the enforcement logic leaves the login of an account it
+    /// finds disabled alone (no disable, no record, no `usermod -U`). The session lock still applies.
     fn login_disabled(&mut self, user: &str) -> Result<bool> {
         let shadow = std::fs::read_to_string("/etc/shadow").context("reading /etc/shadow")?;
         match shadow_state(&shadow, user).with_context(|| format!("{user} not in /etc/shadow"))? {
             ShadowState::Locked => Ok(true),
-            ShadowState::Unlocked | ShadowState::NoPassword => Ok(false),
+            ShadowState::Unlocked => Ok(false),
+            ShadowState::NoPassword => {
+                if self.warned_no_password.insert(user.to_string()) {
+                    tracing::warn!("{user} has no password; its login can't be disabled");
+                }
+                Ok(true)
+            }
         }
     }
 
@@ -278,19 +324,15 @@ impl Actions for SystemActions {
             let _ = run("swaymsg", &["-s", &w.socket.to_string_lossy(), &criteria]);
         }
         let now = Instant::now();
-        // A close round hours later must start over with SIGTERM
+        // Entries for pids that stopped being closed are forgotten (a later round starts with SIGTERM)
         self.closing
-            .retain(|_, since| now.duration_since(*since) < KILL_AFTER * 2);
+            .retain(|_, e| now.duration_since(e.last_seen) < CLOSING_STALE_AFTER);
         for &pid in &app.pids {
-            let signal = match self.closing.get(&pid) {
-                Some(&since) if now.duration_since(since) >= KILL_AFTER => libc_kill(pid, 9),
-                Some(_) => continue,
-                None => {
-                    self.closing.insert(pid, now);
-                    libc_kill(pid, 15)
-                }
-            };
-            if let Err(e) = signal {
+            let (signal, entry) = signal_for(self.closing.get(&pid).copied(), now);
+            self.closing.insert(pid, entry);
+            if let Some(signal) = signal
+                && let Err(e) = libc_kill(pid, signal)
+            {
                 tracing::debug!("signal to {pid}: {e:#}");
             }
         }
@@ -545,5 +587,24 @@ mod tests {
         assert!(!is_gdm_greeter(&["/usr/bin/gnome-shell", "--mode=user"]));
         assert!(!is_gdm_greeter(&["sh", "-c", "gnome-shell --mode=gdm"]));
         assert!(!is_gdm_greeter(&[]));
+    }
+
+    #[test]
+    fn sigkill_follows_sigterm_however_far_apart_the_calls_are() {
+        let t0 = Instant::now();
+        let at = |secs| t0 + Duration::from_secs(secs);
+        let (sig, e) = signal_for(None, t0);
+        assert_eq!(sig, Some(15));
+        // 5 s later: still waiting
+        let (sig, e5) = signal_for(Some(e), at(5));
+        assert_eq!(sig, None);
+        // 12 s after the first (7 s since the last call)
+        assert_eq!(signal_for(Some(e5), at(12)).0, Some(9));
+        // one call 25 s after the first, nothing in between
+        assert_eq!(signal_for(Some(e), at(25)).0, Some(9));
+        // not seen for 30 s: a fresh round
+        let (sig, fresh) = signal_for(Some(e), at(30));
+        assert_eq!(sig, Some(15));
+        assert_eq!(fresh.first_term, at(30));
     }
 }
