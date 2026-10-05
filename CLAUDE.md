@@ -63,7 +63,8 @@ A Cargo workspace (edition 2024) with three crates:
   - apps today and hosts today;
   - whether the account has any rule, and its current decision from `rules::decide`.
 - The rules API (`crates/server/src/api.rs`), all behind the login: `/api/rules/{user}` (and `/{weekday}`,
-  `/copy`, `/copy-to` for whole weeks to other accounts), `/api/messages` (send a note to kids; handed to the
+  `/copy`, `/copy-to` for whole weeks to other accounts), `/api/timers/{user}` (POST `{minutes, mode: lock|games}` starts or replaces a kid's timer, DELETE cancels it or
+  lifts its stop; the timer travels in each snapshot and `decide_with_timer` applies it), `/api/messages` (send a note to kids; handed to the
   first PC reporting them active, streaming or idle, within 10 minutes), `/api/blackouts`, `/api/apps`, `/api/categories`, `/api/events`. Invalid input gets 422 with
   `{"error", "field"}`.
 - Nothing is enforced on the PCs yet: the response to `/api/report` carries no decisions, and the event log

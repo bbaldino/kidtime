@@ -127,6 +127,9 @@ The dashboard has three tabs.
   done, while Enforce is off).
   It also has **Send a message**: a note to one kid or everyone, shown as a notification on the computer
   they're using within about 15 seconds (or in their stream), and dropped if they aren't at a computer within 10 minutes.
+  Each kid's card has a **timer**: 15, 30 or 60 minutes (or any length up to 4 hours), then either the computer
+  locks or games close, until you press Allow again, start another timer, or midnight. Timers only ever end things
+  sooner; allowed hours and budgets still apply. The usual 10/5/1-minute warnings count down to it.
 - **Rules** has an **Enforce** switch per kid, and sets, per kid and per weekday, the allowed hours and a games
   budget, plus one-off blackouts.
   "Copy this week to" replaces another kid's whole week with the one shown (blackouts are not copied).
