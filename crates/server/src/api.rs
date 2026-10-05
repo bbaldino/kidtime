@@ -282,6 +282,41 @@ pub struct EventQuery {
 }
 
 #[derive(Deserialize)]
+pub struct NewTimer {
+    minutes: u32,
+    mode: protocol::rules::TimerMode,
+}
+
+/// Starts (or replaces) a kid's timer.
+pub async fn post_timer(
+    State(state): State<Arc<AppState>>,
+    Path(user): Path<String>,
+    Json(new): Json<NewTimer>,
+) -> Api<Response> {
+    if !(1..=240).contains(&new.minutes) {
+        return Err(invalid("minutes", "a timer can be 1 to 240 minutes"));
+    }
+    let mut db = state.db.lock().unwrap();
+    if !db.is_account(&user)? {
+        return Err(ApiError::NotFound);
+    }
+    let timer = db.start_timer(&user, new.minutes, new.mode, Local::now().naive_local())?;
+    Ok((StatusCode::CREATED, Json(json!({ "ends": timer.ends }))).into_response())
+}
+
+/// Cancels a running timer, or lifts the stop after it ended.
+pub async fn delete_timer(
+    State(state): State<Arc<AppState>>,
+    Path(user): Path<String>,
+) -> Api<StatusCode> {
+    if state.db.lock().unwrap().cancel_timer(&user)? {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::NotFound)
+    }
+}
+
+#[derive(Deserialize)]
 pub struct NewMessage {
     users: Vec<String>,
     text: String,
@@ -904,6 +939,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn timers_are_started_shown_and_cancelled() {
+        let app = app("timers-api");
+        report_for(&app, "kid1").await;
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/api/timers/kid1",
+            Some(json!({ "minutes": 30, "mode": "lock" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert!(body["ends"].is_string());
+        let (_, s) = call(&app, "GET", "/api/status", None).await;
+        let user = s["users"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|u| u["user"] == "kid1")
+            .unwrap()
+            .clone();
+        assert_eq!(user["timer"]["mode"], "lock");
+        assert_eq!(user["timer"]["ended"], false);
+        assert_eq!(user["timer"]["ends"], body["ends"]);
+        // Replace with a games timer, then cancel
+        call(
+            &app,
+            "POST",
+            "/api/timers/kid1",
+            Some(json!({ "minutes": 5, "mode": "games" })),
+        )
+        .await;
+        let (_, s) = call(&app, "GET", "/api/status", None).await;
+        assert_eq!(s["users"][0]["timer"]["mode"], "games");
+        assert_eq!(
+            call(&app, "DELETE", "/api/timers/kid1", None).await.0,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            call(&app, "DELETE", "/api/timers/kid1", None).await.0,
+            StatusCode::NOT_FOUND
+        );
+        let (_, s) = call(&app, "GET", "/api/status", None).await;
+        assert!(s["users"][0]["timer"].is_null());
+    }
+
+    #[tokio::test]
+    async fn starting_a_timer_validates_its_input() {
+        let app = app("timers-bad");
+        report_for(&app, "kid1").await;
+        for minutes in [0, 241] {
+            let (status, body) = call(
+                &app,
+                "POST",
+                "/api/timers/kid1",
+                Some(json!({ "minutes": minutes, "mode": "lock" })),
+            )
+            .await;
+            assert_eq!(
+                (status, body["field"].as_str()),
+                (StatusCode::UNPROCESSABLE_ENTITY, Some("minutes")),
+                "{minutes}"
+            );
+        }
+        let (status, _) = call(
+            &app,
+            "POST",
+            "/api/timers/kid1",
+            Some(json!({ "minutes": 10, "mode": "nap" })),
+        )
+        .await;
+        assert!(status.is_client_error());
+        assert_eq!(
+            call(
+                &app,
+                "POST",
+                "/api/timers/nobody",
+                Some(json!({ "minutes": 10, "mode": "lock" }))
+            )
+            .await
+            .0,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
     async fn sending_a_message_validates_its_input() {
         let app = app("messages-bad");
         report_for(&app, "kid1").await;
@@ -1050,6 +1170,8 @@ mod tests {
             ("PUT", "/api/rules/kid1/0"),
             ("PUT", "/api/accounts/kid1/enforce"),
             ("GET", "/api/messages"),
+            ("POST", "/api/timers/kid1"),
+            ("DELETE", "/api/timers/kid1"),
             ("POST", "/api/messages"),
             ("POST", "/api/rules/kid1/copy"),
             ("POST", "/api/rules/kid1/copy-to"),

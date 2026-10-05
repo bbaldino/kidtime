@@ -129,6 +129,10 @@ pub(crate) fn router(state: Arc<AppState>) -> Router {
         .route("/api/status", get(status))
         .route("/api/rules/{user}", get(api::get_rules))
         .route("/api/accounts/{user}/enforce", put(api::put_enforce))
+        .route(
+            "/api/timers/{user}",
+            post(api::post_timer).delete(api::delete_timer),
+        )
         .route("/api/rules/{user}/copy", post(api::copy_rule))
         .route("/api/rules/{user}/copy-to", post(api::copy_week))
         .route("/api/rules/{user}/{weekday}", put(api::put_rule))
@@ -358,6 +362,15 @@ struct UserStatus {
     overrun: Vec<String>,
     /// Problems agents hit carrying out decisions, from the hosts reporting now.
     errors: Vec<String>,
+    /// The parent's timer, while it or its stop is in effect.
+    timer: Option<TimerStatus>,
+}
+
+#[derive(Serialize)]
+struct TimerStatus {
+    ends: chrono::NaiveDateTime,
+    mode: protocol::rules::TimerMode,
+    ended: bool,
 }
 
 #[derive(Serialize)]
@@ -472,6 +485,14 @@ async fn status(State(state): State<Arc<AppState>>) -> Result<Json<Status>, Stat
             .ok();
         let restricted = db.is_restricted(&name).map_err(internal)?;
         let enforce = db.enforce(&name).map_err(internal)?;
+        let timer = db
+            .timer(&name, now_local)
+            .map_err(internal)?
+            .map(|t| TimerStatus {
+                ended: now_local >= t.ends,
+                ends: t.ends,
+                mode: t.mode,
+            });
         let sorted = |mut list: Vec<String>| {
             list.sort();
             list.dedup();
@@ -486,6 +507,7 @@ async fn status(State(state): State<Arc<AppState>>) -> Result<Json<Status>, Stat
             enforce,
             overrun,
             errors,
+            timer,
             state,
             host,
             today_secs: days.last().map_or(0, |d| d.secs),

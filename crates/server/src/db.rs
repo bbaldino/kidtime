@@ -15,7 +15,9 @@ use protocol::{App, Report, Sample, UserSample, UserState};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-use protocol::rules::{self, BlackoutSpan, CategoryId, Computer, DayRule, Decision, Stretch};
+use protocol::rules::{
+    self, BlackoutSpan, CategoryId, Computer, DayRule, Decision, Stretch, Timer, TimerMode,
+};
 pub use protocol::rules::{GAMES, IGNORED};
 
 #[derive(Debug, Serialize)]
@@ -172,6 +174,12 @@ fn add_column_if_missing(
 
 /// How local date-times are stored; this form sorts correctly as text.
 const LOCAL_TIME: &str = "%Y-%m-%dT%H:%M:%S";
+fn timer_mode_text(mode: TimerMode) -> &'static str {
+    match mode {
+        TimerMode::Lock => "lock",
+        TimerMode::Games => "games",
+    }
+}
 
 fn local_text(t: NaiveDateTime) -> String {
     t.format(LOCAL_TIME).to_string()
@@ -293,6 +301,12 @@ impl Db {
                  detail TEXT NOT NULL
              );
              CREATE INDEX IF NOT EXISTS event_user_id ON event (user, id);
+             CREATE TABLE IF NOT EXISTS timer (
+                 user    TEXT PRIMARY KEY,
+                 started INTEGER NOT NULL,
+                 ends    TEXT NOT NULL,
+                 mode    TEXT NOT NULL
+             );
              CREATE TABLE IF NOT EXISTS message (
                  id         INTEGER PRIMARY KEY,
                  user       TEXT NOT NULL,
@@ -772,7 +786,7 @@ impl Db {
             used_secs: self.category_secs(user, now.date())?,
             games: self.app_ids_in(GAMES)?,
             ignored: self.app_ids_in(IGNORED)?,
-            timer: None,
+            timer: self.timer(user, now)?,
         })
     }
 
@@ -782,7 +796,66 @@ impl Db {
         let rule = self.day_rule(user, weekday)?;
         let spans = self.blackout_spans(user, now)?;
         let used = self.category_secs(user, now.date())?;
-        Ok(rules::decide(&rule, &spans, &used, now))
+        let timer = self.timer(user, now)?;
+        Ok(rules::decide_with_timer(
+            &rule,
+            &spans,
+            &used,
+            timer.as_ref(),
+            now,
+        ))
+    }
+
+    /// Starts (or replaces) the account's timer: it ends `minutes` after `now`.
+    pub fn start_timer(
+        &mut self,
+        user: &str,
+        minutes: u32,
+        mode: TimerMode,
+        now: NaiveDateTime,
+    ) -> Result<Timer> {
+        // Whole seconds: that's what is stored, so the reply and later reads agree
+        let ends = now + chrono::Duration::minutes(i64::from(minutes));
+        let ends = chrono::Timelike::with_nanosecond(&ends, 0).unwrap_or(ends);
+        let timer = Timer { ends, mode };
+        self.conn.execute(
+            "INSERT INTO timer (user, started, ends, mode) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (user) DO UPDATE SET started = excluded.started, ends = excluded.ends, mode = excluded.mode",
+            params![user, Local::now().timestamp(), local_text(timer.ends), timer_mode_text(mode)],
+        )?;
+        Ok(timer)
+    }
+
+    /// Removes the account's timer ("Cancel" or "Allow again"). False if it had none.
+    pub fn cancel_timer(&mut self, user: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .execute("DELETE FROM timer WHERE user = ?1", [user])?
+            > 0)
+    }
+
+    /// The account's timer, unless its stop has already passed at `now`.
+    pub fn timer(&self, user: &str, now: NaiveDateTime) -> Result<Option<Timer>> {
+        let row: Option<(String, String)> = self
+            .conn
+            .query_row(
+                "SELECT ends, mode FROM timer WHERE user = ?1",
+                [user],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((ends, mode)) = row else {
+            return Ok(None);
+        };
+        let timer = Timer {
+            ends: parse_local(ends)?,
+            mode: if mode == "games" {
+                TimerMode::Games
+            } else {
+                TimerMode::Lock
+            },
+        };
+        Ok((now < timer.stop_until()).then_some(timer))
     }
 
     /// Remembers the decision if it differs from the account's last one. Returns whether that added
@@ -941,6 +1014,13 @@ impl Db {
     }
 
     pub fn prune(&mut self, now: i64) -> Result<()> {
+        // A timer's stop lasts until the midnight after it ended, so anything that ended before today is done
+        if let Some(today) = Local.timestamp_opt(now, 0).single().map(|t| t.date_naive()) {
+            self.conn.execute(
+                "DELETE FROM timer WHERE ends < ?1",
+                [local_text(today.and_time(chrono::NaiveTime::MIN))],
+            )?;
+        }
         self.conn
             .execute("DELETE FROM message WHERE created < ?1", [now - KEEP_SECS])?;
         self.conn
@@ -2129,6 +2209,65 @@ mod tests {
         );
         assert_eq!(snap.games, ["steam:1"]);
         assert_eq!(snap.ignored, ["kitty"]);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn timers_start_replace_cancel_and_expire() {
+        use protocol::rules::{Timer, TimerMode};
+        let (mut db, path) = temp_db("timers");
+        let now = noon_today();
+        assert_eq!(db.timer("kid1", now).unwrap(), None);
+        let t = db.start_timer("kid1", 30, TimerMode::Lock, now).unwrap();
+        assert_eq!(
+            t,
+            Timer {
+                ends: now + chrono::Duration::minutes(30),
+                mode: TimerMode::Lock
+            }
+        );
+        assert_eq!(db.timer("kid1", now).unwrap(), Some(t.clone()));
+        // A new timer replaces the old one
+        let t2 = db.start_timer("kid1", 15, TimerMode::Games, now).unwrap();
+        assert_eq!(db.timer("kid1", now).unwrap(), Some(t2));
+        // The snapshot carries it, and the server's decision follows it
+        assert_eq!(
+            db.snapshot("kid1", now).unwrap().timer,
+            db.timer("kid1", now).unwrap()
+        );
+        db.start_timer("kid1", 1, TimerMode::Lock, now).unwrap();
+        let later = now + chrono::Duration::minutes(5);
+        assert!(matches!(
+            db.decision("kid1", later).unwrap().computer,
+            Computer::TimerEnded { .. }
+        ));
+        // Past the midnight after it ended, it's gone (and pruned)
+        let tomorrow = now + chrono::Duration::days(1);
+        assert_eq!(db.timer("kid1", tomorrow).unwrap(), None);
+        db.start_timer("kid2", 10, TimerMode::Lock, now - chrono::Duration::days(2))
+            .unwrap();
+        db.prune(Local::now().timestamp()).unwrap();
+        let rows: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM timer", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 1, "kid2's two-day-old timer is pruned, kid1's stays");
+        assert!(db.cancel_timer("kid1").unwrap());
+        assert!(!db.cancel_timer("kid1").unwrap());
+        assert_eq!(db.timer("kid1", later).unwrap(), None);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn a_timer_ending_is_logged_as_locked_timer_ended() {
+        let (mut db, path) = temp_db("timer-event");
+        let d = decision_of(Computer::TimerEnded { at: noon_today() }, &[]);
+        db.log_decision("kid1", 100, &d, true, "host-a").unwrap();
+        let e = &db.events(Some("kid1"), 10).unwrap()[0];
+        assert_eq!(
+            (e.kind.as_str(), e.detail.as_str()),
+            ("locked", "timer ended")
+        );
         std::fs::remove_file(&path).unwrap();
     }
 
