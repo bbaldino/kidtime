@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.7.0](https://github.com/bbaldino/kidtime/compare/v0.6.0...v0.7.0) (2026-10-05)
+
+
+### Features
+
+* **agent:** enforce timers ([186b8fc](https://github.com/bbaldino/kidtime/commit/186b8fc508d0d45b3ad9d391f7cf0761f9f4d081))
+* **dashboard:** start and cancel timers ([84ed33f](https://github.com/bbaldino/kidtime/commit/84ed33f283848ae65b1b412e3b66fd05d79cf266))
+* **protocol:** add timers to the decision function ([d164964](https://github.com/bbaldino/kidtime/commit/d1649647224207406921db424bd23700b66801bd))
+* **server:** start and cancel timers ([89dfaa3](https://github.com/bbaldino/kidtime/commit/89dfaa3757b0f02a29fcc7c38c7c1360f95f422e))
+
+
+### Bug Fixes
+
+* warn again for a second games timer, and word timer ends as such ([7eea16f](https://github.com/bbaldino/kidtime/commit/7eea16f394ad8c795041d11f7e961d88deb9f3d4))
+
 ## [0.6.0](https://github.com/bbaldino/kidtime/compare/v0.5.0...v0.6.0) (2026-10-05)
 
 
