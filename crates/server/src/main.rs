@@ -141,6 +141,10 @@ pub(crate) fn router(state: Arc<AppState>) -> Router {
         .route("/api/apps/{id}", put(api::put_app))
         .route("/api/categories", get(api::get_categories))
         .route("/api/events", get(api::get_events))
+        .route(
+            "/api/messages",
+            get(api::get_messages).post(api::post_message),
+        )
         .route("/", get(|| asset("index.html")))
         .route(
             "/{file}",
@@ -229,7 +233,7 @@ async fn report(
     }
 
     let now_local = Local::now().naive_local();
-    let accounts = {
+    let (accounts, messages) = {
         let mut db = state.db.lock().unwrap();
         // From here on only the report as recorded is used, with its names clipped
         report = match db.record(&report) {
@@ -281,7 +285,27 @@ async fn report(
                 Err(e) => tracing::error!("snapshot for {user}: {e:#}"),
             }
         }
-        accounts
+
+        // Messages go to the first PC that reports the kid at the computer (not locked or away)
+        let mut messages = Vec::new();
+        for u in report
+            .samples
+            .last()
+            .into_iter()
+            .flat_map(|s| s.users.iter())
+        {
+            if !matches!(
+                u.state,
+                UserState::Active | UserState::Streaming | UserState::Idle
+            ) {
+                continue;
+            }
+            match db.take_messages(&u.user, &report.host, now()) {
+                Ok(mut m) => messages.append(&mut m),
+                Err(e) => tracing::error!("messages for {}: {e:#}", u.user),
+            }
+        }
+        (accounts, messages)
     };
     if let Some(latest) = report.samples.last() {
         state.live.lock().unwrap().insert(
@@ -298,6 +322,7 @@ async fn report(
         Json(protocol::ReportResponse {
             server_time: now_local,
             accounts,
+            messages,
         }),
     )
         .into_response()

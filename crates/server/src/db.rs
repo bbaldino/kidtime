@@ -39,8 +39,26 @@ pub struct Blackout {
     pub note: String,
 }
 
-/// A change in what the rules say for an account. Nothing is enforced yet, so these record what
-/// would have happened.
+/// How long a message waits for its account to be at a computer.
+pub const MESSAGE_TTL_SECS: i64 = 600;
+/// The longest message the dashboard may send.
+pub const MAX_MESSAGE_CHARS: usize = 200;
+
+/// A message as the dashboard lists it.
+#[derive(Debug, Serialize)]
+pub struct MessageRow {
+    pub id: i64,
+    pub user: String,
+    pub text: String,
+    pub created: i64,
+    pub expires: i64,
+    /// The PC it was shown on, and when; `None` while waiting or after it expired unshown.
+    pub shown_host: Option<String>,
+    pub shown_at: Option<i64>,
+}
+
+/// A change in what the rules say for an account: what enforcement did, or for an account with
+/// Enforce off, what it would have done.
 #[derive(Debug, Serialize)]
 pub struct Event {
     pub id: i64,
@@ -274,6 +292,16 @@ impl Db {
                  detail TEXT NOT NULL
              );
              CREATE INDEX IF NOT EXISTS event_user_id ON event (user, id);
+             CREATE TABLE IF NOT EXISTS message (
+                 id         INTEGER PRIMARY KEY,
+                 user       TEXT NOT NULL,
+                 text       TEXT NOT NULL,
+                 created    INTEGER NOT NULL,
+                 expires    INTEGER NOT NULL,
+                 shown_host TEXT,
+                 shown_at   INTEGER
+             );
+             CREATE INDEX IF NOT EXISTS message_user_expires ON message (user, expires);
              CREATE TABLE IF NOT EXISTS account_settings (
                  user    TEXT PRIMARY KEY,
                  enforce INTEGER NOT NULL
@@ -847,7 +875,71 @@ impl Db {
     }
 
     /// Drops per-app stretches and events older than 30 days. Daily totals are kept.
+    /// Stores a message for one account; it is handed out until `MESSAGE_TTL_SECS` after `now`.
+    pub fn add_message(&mut self, user: &str, text: &str, now: i64) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO message (user, text, created, expires) VALUES (?1, ?2, ?3, ?4)",
+            params![user, text, now, now + MESSAGE_TTL_SECS],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// The account's unexpired messages nobody has been shown yet, marked as shown on `host`.
+    pub fn take_messages(
+        &mut self,
+        user: &str,
+        host: &str,
+        now: i64,
+    ) -> Result<Vec<protocol::Message>> {
+        let tx = self.conn.transaction()?;
+        let messages: Vec<protocol::Message> = {
+            let mut stmt = tx.prepare(
+                "SELECT id, user, text FROM message
+                 WHERE user = ?1 AND shown_host IS NULL AND expires > ?2 ORDER BY id",
+            )?;
+            stmt.query_map(params![user, now], |r| {
+                Ok(protocol::Message {
+                    id: r.get(0)?,
+                    user: r.get(1)?,
+                    text: r.get(2)?,
+                })
+            })?
+            .collect::<Result<_, _>>()?
+        };
+        for m in &messages {
+            tx.execute(
+                "UPDATE message SET shown_host = ?2, shown_at = ?3 WHERE id = ?1",
+                params![m.id, host, now],
+            )?;
+        }
+        tx.commit()?;
+        Ok(messages)
+    }
+
+    /// Newest first.
+    pub fn recent_messages(&self, limit: u32) -> Result<Vec<MessageRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, user, text, created, expires, shown_host, shown_at FROM message ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map([limit], |r| {
+                Ok(MessageRow {
+                    id: r.get(0)?,
+                    user: r.get(1)?,
+                    text: r.get(2)?,
+                    created: r.get(3)?,
+                    expires: r.get(4)?,
+                    shown_host: r.get(5)?,
+                    shown_at: r.get(6)?,
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
+    }
+
     pub fn prune(&mut self, now: i64) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM message WHERE created < ?1", [now - KEEP_SECS])?;
         self.conn
             .execute("DELETE FROM app_activity WHERE end < ?1", [now - KEEP_SECS])?;
         self.conn
@@ -2034,6 +2126,47 @@ mod tests {
         );
         assert_eq!(snap.games, ["steam:1"]);
         assert_eq!(snap.ignored, ["kitty"]);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn messages_are_handed_out_once_and_expire() {
+        let (mut db, path) = temp_db("messages");
+        let now = 1_000_000;
+        let dinner = db.add_message("kid1", "dinner in 5 minutes", now).unwrap();
+        let old = db
+            .add_message("kid1", "too late", now - MESSAGE_TTL_SECS - 1)
+            .unwrap();
+        db.add_message("kid2", "not yours", now).unwrap();
+
+        let handed = db.take_messages("kid1", "host-a", now + 10).unwrap();
+        assert_eq!(
+            handed,
+            [protocol::Message {
+                id: dinner,
+                user: "kid1".into(),
+                text: "dinner in 5 minutes".into()
+            }]
+        );
+        // Only once, and not to a second PC
+        assert!(
+            db.take_messages("kid1", "host-b", now + 20)
+                .unwrap()
+                .is_empty()
+        );
+
+        let recent = db.recent_messages(10).unwrap();
+        assert_eq!(recent.len(), 3);
+        let shown = recent.iter().find(|m| m.id == dinner).unwrap();
+        assert_eq!(
+            (shown.shown_host.as_deref(), shown.shown_at),
+            (Some("host-a"), Some(now + 10))
+        );
+        let expired = recent.iter().find(|m| m.id == old).unwrap();
+        assert_eq!(expired.shown_host, None);
+        assert!(expired.expires < now);
+        // Newest first
+        assert!(recent[0].created >= recent[2].created);
         std::fs::remove_file(&path).unwrap();
     }
 

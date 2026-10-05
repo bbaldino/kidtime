@@ -205,9 +205,56 @@ window.addEventListener("scroll", hideTip, { passive: true });
 const usersEl = document.getElementById("users");
 const updatedEl = document.getElementById("updated");
 
+// "shown on host-a at 7:42pm", "waiting", or "not shown (expired)"
+function messageStatus(m, now) {
+  const at = (t) => new Date(t * 1000).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  if (m.shown_host) return `shown on ${esc(m.shown_host)} at ${at(m.shown_at)}`;
+  return m.expires * 1000 > now ? "waiting" : "not shown (expired)";
+}
+
+function messagesHtml(messages) {
+  if (!messages.length) return '<li class="empty-note">No messages yet.</li>';
+  const now = Date.now();
+  return messages.map((m) => `<li><span class="event-when">${esc(new Date(m.created * 1000).toLocaleString(undefined, { weekday: "short", hour: "numeric", minute: "2-digit" }))}</span> <span class="event-who">${esc(m.user)}</span> “${esc(m.text)}”: ${messageStatus(m, now)}</li>`).join("");
+}
+
+// The recipient list follows the accounts on the dashboard, keeping the current choice
+function updateRecipients(users) {
+  const select = document.getElementById("message-to");
+  const current = select.value;
+  const options = [`<option value="*">Everyone</option>`].concat(users.map((u) => `<option value="${esc(u)}">${esc(u)}</option>`));
+  const html = options.join("");
+  if (select.dataset.html !== html) {
+    select.innerHTML = html;
+    select.dataset.html = html;
+    if ([...select.options].some((o) => o.value === current)) select.value = current;
+  }
+}
+
+document.getElementById("message-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const form = e.target;
+  const error = document.getElementById("message-error");
+  const button = form.querySelector("button");
+  error.hidden = true;
+  const to = form.elements.to.value;
+  const users = to === "*" ? (window.kidtimeUsers ?? []) : [to];
+  button.disabled = true;
+  try {
+    await api("/api/messages", { method: "POST", body: { users, text: form.elements.text.value } });
+    form.elements.text.value = "";
+    document.getElementById("messages").innerHTML = messagesHtml(await api("/api/messages"));
+  } catch (err) {
+    error.textContent = err.message || "Couldn't send. Try again.";
+    error.hidden = false;
+  } finally {
+    button.disabled = false;
+  }
+});
+
 async function refresh() {
   try {
-    const [status, events] = await Promise.all([api("/api/status"), api("/api/events")]);
+    const [status, events, messages] = await Promise.all([api("/api/status"), api("/api/events"), api("/api/messages").catch(() => null)]);
     // Without the names the cards still render; the next refresh asks again
     if (!categories.length) categories = await api("/api/categories").catch(() => []);
     // Overrun apps come as ids; names are nice to have, so a failed fetch just shows ids
@@ -220,6 +267,8 @@ async function refresh() {
       : '<article class="card"><p class="empty-note">No activity reported yet. Is an agent running?</p></article>';
     document.getElementById("events").innerHTML = eventsHtml(events);
     window.kidtimeUsers = status.users.map((u) => u.user);
+    updateRecipients(window.kidtimeUsers);
+    if (messages) document.getElementById("messages").innerHTML = messagesHtml(messages);
     updatedEl.classList.remove("error");
     updatedEl.textContent = `Updated ${new Date(status.generated_at * 1000).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`;
   } catch {

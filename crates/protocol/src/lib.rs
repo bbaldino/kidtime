@@ -54,6 +54,17 @@ pub struct ReportResponse {
     /// The server's local wall-clock time, so an agent can tell if its own clock is off.
     pub server_time: NaiveDateTime,
     pub accounts: Vec<AccountSnapshot>,
+    /// Messages from the parent to show now, each to one account at this PC. Not persisted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub messages: Vec<Message>,
+}
+
+/// A message typed on the dashboard, handed to the PC where its account is at the computer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Message {
+    pub id: i64,
+    pub user: String,
+    pub text: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -134,12 +145,22 @@ mod tests {
                 games: vec!["steam:1".into()],
                 ignored: vec!["kitty".into()],
             }],
+            messages: vec![Message {
+                id: 3,
+                user: "kid1".into(),
+                text: "dinner in 5 minutes".into(),
+            }],
         };
         let json = serde_json::to_string(&response).unwrap();
         assert_eq!(
             serde_json::from_str::<ReportResponse>(&json).unwrap(),
             response
         );
+
+        // A response from a server that predates messages still parses
+        let without: ReportResponse =
+            serde_json::from_str(r#"{"server_time":"2026-10-05T12:00:00","accounts":[]}"#).unwrap();
+        assert!(without.messages.is_empty());
 
         // A sample from an agent that predates overrun/errors
         let old = r#"{"user":"kid1","state":"active","apps":[]}"#;

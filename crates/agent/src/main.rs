@@ -217,6 +217,12 @@ async fn main() -> Result<()> {
                             tracing::info!("{} samples still queued", pending.len());
                         }
                         let body = response.bytes().await.map_err(|e| e.to_string());
+                        if let Ok(bytes) = &body {
+                            for (user, text) in messages_to_show(bytes, &config.users) {
+                                tracing::info!("showing a message from home to {user}");
+                                enforce::Actions::notify(&mut actions, &user, &text);
+                            }
+                        }
                         // The response resets the local count, so it only applies once the server has every
                         // sample counted here; with a backlog, the reply to the last batch does
                         if pending.is_empty() {
@@ -336,6 +342,20 @@ fn release_everything(setup: ReleaseSetup) -> Result<()> {
 fn enforcer_today(enforcer: &enforce::Enforcer) -> NaiveDate {
     (Local::now().naive_local() + chrono::Duration::seconds(enforcer.persisted.clock_offset_secs))
         .date()
+}
+
+/// Messages from home in a report response, for accounts tracked here, as the text to show.
+/// They're shown whatever else the reply says, even while a backlog of samples is still being sent.
+fn messages_to_show(body: &[u8], tracked: &[String]) -> Vec<(String, String)> {
+    let Ok(response) = serde_json::from_slice::<ReportResponse>(body) else {
+        return Vec::new();
+    };
+    response
+        .messages
+        .into_iter()
+        .filter(|m| tracked.contains(&m.user))
+        .map(|m| (m.user, format!("Message from home: {}", m.text)))
+        .collect()
 }
 
 /// What a successful (2xx) report response says.
@@ -685,6 +705,29 @@ mod tests {
     }
 
     #[test]
+    fn messages_are_shown_only_for_tracked_accounts() {
+        let body = serde_json::json!({
+            "server_time": "2026-10-05T12:00:00",
+            "accounts": [],
+            "messages": [
+                { "id": 1, "user": "kid1", "text": "dinner in 5 minutes" },
+                { "id": 2, "user": "someone-else", "text": "not here" },
+            ],
+        })
+        .to_string();
+        let tracked = vec!["kid1".to_string(), "kid2".to_string()];
+        assert_eq!(
+            messages_to_show(body.as_bytes(), &tracked),
+            [(
+                "kid1".to_string(),
+                "Message from home: dinner in 5 minutes".to_string()
+            )]
+        );
+        assert!(messages_to_show(b"", &tracked).is_empty());
+        assert!(messages_to_show(b"not json", &tracked).is_empty());
+    }
+
+    #[test]
     fn replies_are_classified() {
         assert!(matches!(parse_reply(b""), Reply::NoRules));
         assert!(matches!(parse_reply(b" \n"), Reply::NoRules));
@@ -724,6 +767,7 @@ mod tests {
             })
             .collect();
         serde_json::to_string(&ReportResponse {
+            messages: Vec::new(),
             server_time: now,
             accounts,
         })

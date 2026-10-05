@@ -28,6 +28,17 @@
     <section id="tab-today">
       <div id="users" class="users"></div>
       <section class="card log">
+        <h2>Send a message</h2>
+        <form id="message-form" class="editor">
+          <label>To <select name="to" id="message-to"></select></label>
+          <label>Message <input type="text" name="text" maxlength="200" required placeholder="Dinner in 5 minutes"></label>
+          <p class="form-error" id="message-error" role="alert" hidden></p>
+          <button type="submit">Send</button>
+        </form>
+        <p class="footnote">Shown on the computer they're using, within about 15 seconds. Not shown after 10 minutes if they aren't at a computer.</p>
+        <ul id="messages" class="events"></ul>
+      </section>
+      <section class="card log">
         <h2>What the rules did</h2>
         <p class="footnote">Kids with Enforce on are acted on. For the others this shows when kidtime would have acted.</p>
         <ul id="events" class="events"></ul>

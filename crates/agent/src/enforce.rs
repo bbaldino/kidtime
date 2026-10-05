@@ -881,6 +881,7 @@ mod tests {
         let mut e = Enforcer::new(Persisted::default());
         e.apply_response(
             &ReportResponse {
+                messages: Vec::new(),
                 server_time,
                 accounts: snaps,
             },
@@ -993,6 +994,7 @@ mod tests {
         snap.for_day = next.date();
         e.apply_response(
             &ReportResponse {
+                messages: Vec::new(),
                 server_time: next,
                 accounts: vec![snap],
             },
@@ -1018,6 +1020,7 @@ mod tests {
         snap.for_day = day();
         e.apply_response(
             &ReportResponse {
+                messages: Vec::new(),
                 server_time: at(21, 5),
                 accounts: vec![snap],
             },
@@ -1128,6 +1131,7 @@ mod tests {
         ];
         e.apply_response(
             &ReportResponse {
+                messages: Vec::new(),
                 server_time: at(20, 56),
                 accounts: vec![snap],
             },
@@ -1218,6 +1222,7 @@ mod tests {
         snap.used_secs = BTreeMap::from([(GAMES, 25 * 60)]); // the server has those samples now
         e.apply_response(
             &ReportResponse {
+                messages: Vec::new(),
                 server_time: at(15, 25),
                 accounts: vec![snap],
             },
@@ -1258,6 +1263,7 @@ mod tests {
         let mut e = Enforcer::new(Persisted::default());
         e.apply_response(
             &ReportResponse {
+                messages: Vec::new(),
                 server_time: at(21, 0),
                 accounts: vec![snapshot("kid1", evenings())],
             },
@@ -1270,6 +1276,7 @@ mod tests {
         let mut e = Enforcer::new(Persisted::default());
         e.apply_response(
             &ReportResponse {
+                messages: Vec::new(),
                 server_time: at(20, 2),
                 accounts: vec![snapshot("kid1", evenings())],
             },
@@ -1704,6 +1711,7 @@ mod tests {
         fake.take();
         e.apply_response(
             &ReportResponse {
+                messages: Vec::new(),
                 server_time: at(21, 1),
                 accounts: vec![snapshot("kid2", evenings())],
             },

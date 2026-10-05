@@ -281,6 +281,50 @@ pub struct EventQuery {
     user: Option<String>,
 }
 
+#[derive(Deserialize)]
+pub struct NewMessage {
+    users: Vec<String>,
+    text: String,
+}
+
+/// Queues a message for each account; agents show it where the kid is at the computer.
+pub async fn post_message(
+    State(state): State<Arc<AppState>>,
+    Json(new): Json<NewMessage>,
+) -> Api<Response> {
+    let text = new.text.trim();
+    if text.is_empty() {
+        return Err(invalid("text", "write a message"));
+    }
+    if text.chars().count() > crate::db::MAX_MESSAGE_CHARS {
+        return Err(invalid("text", "a message can be at most 200 characters"));
+    }
+    let mut users = new.users;
+    users.sort();
+    users.dedup();
+    if users.is_empty() {
+        return Err(invalid("users", "choose who to send it to"));
+    }
+    let mut db = state.db.lock().unwrap();
+    for user in &users {
+        if !db.is_account(user)? {
+            return Err(invalid("users", "unknown account"));
+        }
+    }
+    let now = Local::now().timestamp();
+    let ids = users
+        .iter()
+        .map(|user| db.add_message(user, text, now))
+        .collect::<anyhow::Result<Vec<i64>>>()?;
+    Ok((StatusCode::CREATED, Json(json!({ "ids": ids }))).into_response())
+}
+
+pub async fn get_messages(
+    State(state): State<Arc<AppState>>,
+) -> Api<Json<Vec<crate::db::MessageRow>>> {
+    Ok(Json(state.db.lock().unwrap().recent_messages(20)?))
+}
+
 pub async fn get_events(
     State(state): State<Arc<AppState>>,
     Query(query): Query<EventQuery>,
@@ -802,6 +846,104 @@ mod tests {
         );
     }
 
+    async fn report_state(
+        app: &TestApp,
+        host: &str,
+        seq: u64,
+        user: &str,
+        state: &str,
+    ) -> serde_json::Value {
+        let at = chrono::Local::now().timestamp();
+        let body = json!({ "host": host, "agent_id": host, "interval_secs": 15, "samples": [{
+            "seq": seq, "at": at, "elapsed_secs": 15,
+            "users": [{ "user": user, "state": state, "apps": [] }],
+        }]});
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/report")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer token")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = router(app.state.clone()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn messages_go_to_the_first_pc_where_the_kid_is_present() {
+        let app = app("messages");
+        report_for(&app, "kid1").await;
+        report_for(&app, "kid2").await;
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/api/messages",
+            Some(json!({ "users": ["kid1"], "text": "  dinner in 5 minutes  " })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(body["ids"].as_array().unwrap().len(), 1);
+
+        // Not handed to a PC where kid1 is locked or offline
+        let reply = report_state(&app, "host-a", 10, "kid1", "locked").await;
+        assert!(reply.get("messages").is_none());
+        // Handed to the PC where kid1 is at the computer, text trimmed
+        let reply = report_state(&app, "host-b", 10, "kid1", "active").await;
+        assert_eq!(
+            reply["messages"],
+            json!([{ "id": body["ids"][0], "user": "kid1", "text": "dinner in 5 minutes" }])
+        );
+        // Only once
+        let reply = report_state(&app, "host-a", 11, "kid1", "active").await;
+        assert!(reply.get("messages").is_none());
+
+        let (_, recent) = call(&app, "GET", "/api/messages", None).await;
+        assert_eq!(recent[0]["shown_host"], "host-b");
+        assert_eq!(recent[0]["user"], "kid1");
+    }
+
+    #[tokio::test]
+    async fn sending_a_message_validates_its_input() {
+        let app = app("messages-bad");
+        report_for(&app, "kid1").await;
+        let empty = json!({ "users": ["kid1"], "text": "   " });
+        assert_eq!(
+            call(&app, "POST", "/api/messages", Some(empty)).await.1["field"],
+            "text"
+        );
+        let long = json!({ "users": ["kid1"], "text": "x".repeat(201) });
+        assert_eq!(
+            call(&app, "POST", "/api/messages", Some(long)).await.1["field"],
+            "text"
+        );
+        let nobody = json!({ "users": [], "text": "hi" });
+        assert_eq!(
+            call(&app, "POST", "/api/messages", Some(nobody)).await.1["field"],
+            "users"
+        );
+        let unknown = json!({ "users": ["kid1", "nobody"], "text": "hi" });
+        assert_eq!(
+            call(&app, "POST", "/api/messages", Some(unknown)).await.1["field"],
+            "users"
+        );
+        // Nothing was stored by the rejected requests
+        assert_eq!(call(&app, "GET", "/api/messages", None).await.1, json!([]));
+        // Two kids at once
+        let both = call(
+            &app,
+            "POST",
+            "/api/messages",
+            Some(json!({ "users": ["kid1", "kid1"], "text": "hi" })),
+        )
+        .await;
+        assert_eq!(
+            both.1["ids"].as_array().unwrap().len(),
+            1,
+            "duplicates collapse"
+        );
+    }
+
     #[tokio::test]
     async fn status_carries_enforce_overrun_and_errors() {
         let app = app("status-extras");
@@ -907,6 +1049,8 @@ mod tests {
             ("GET", "/api/rules/kid1"),
             ("PUT", "/api/rules/kid1/0"),
             ("PUT", "/api/accounts/kid1/enforce"),
+            ("GET", "/api/messages"),
+            ("POST", "/api/messages"),
             ("POST", "/api/rules/kid1/copy"),
             ("POST", "/api/rules/kid1/copy-to"),
             ("GET", "/api/blackouts"),
