@@ -245,3 +245,9 @@ main { max-width: 960px; margin: 0 auto; }
 .ignored { margin-top: 16px; }
 .ignored summary { cursor: pointer; color: var(--text-secondary); font-weight: 600; padding: 6px 0; }
 .copy-week { margin-top: 12px; }
+.timer-form { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 12px 0 0; }
+.timer-form input[type="number"] { width: 5em; }
+.timer-form button, .timer-form input, .timer-form select, .timer-line button { font: inherit; padding: 4px 8px; min-height: 32px; }
+.timer-form .form-error { flex-basis: 100%; }
+.timer-label { font-weight: 600; margin-right: 4px; }
+.timer-line { margin: 12px 0 0; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }

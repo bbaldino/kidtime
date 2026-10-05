@@ -74,7 +74,7 @@ function decisionHtml(u) {
   if (!u.decision) return overrun + errors;
   const d = u.decision;
   // An account with no rules of its own can still be named in a blackout
-  if (!u.restricted && d.computer.state === "allowed") return overrun + errors;
+  if (!u.restricted && d.computer.state === "allowed" && !d.categories.length) return overrun + errors;
   const locked = u.enforce ? "Locked" : "Would be locked";
   let line;
   if (d.computer.state === "allowed") {
@@ -82,9 +82,11 @@ function decisionHtml(u) {
     const midnight = d.next_change?.split("T")[1] === "00:00:00";
     line = !d.next_change || midnight ? "Allowed" : `Allowed until ${esc(clock(d.next_change))}`;
   } else if (d.computer.state === "blackout") line = `${locked}: blackout until ${esc(clock(d.computer.until))}${d.computer.note ? ` (${esc(d.computer.note)})` : ""}`;
+  else if (d.computer.state === "timer_ended") line = `${locked}: timer ended at ${esc(clock(d.computer.at))}`;
   else line = `${locked}: outside allowed hours`;
+  const gamesTimerEnded = u.timer?.mode === "games" && u.timer.ended;
   const budgets = d.categories.map((c) => c.used_up
-    ? `<li><strong>${esc(categoryName(c.category))}</strong> budget used up${c.category === GAMES /* from manage.js */ && u.enforce ? ": games closed" : ""}</li>`
+    ? `<li><strong>${esc(categoryName(c.category))}</strong> ${c.category === GAMES /* from manage.js */ && gamesTimerEnded ? "timer ended" : "budget used up"}${c.category === GAMES && u.enforce ? ": games closed" : ""}</li>`
     : `<li><strong>${esc(categoryName(c.category))}</strong> ${duration(c.left_secs)} left</li>`).join("");
   return `<div class="decision"><p>${line}</p>${budgets ? `<ul>${budgets}</ul>` : ""}${overrun}</div>${errors}`;
 }
@@ -156,6 +158,37 @@ function weekHtml(u) {
   return `<div class="week" role="img" aria-label="Daily screen time, last 7 days">${cols}</div><div class="week-labels" aria-hidden="true">${labels}</div>`;
 }
 
+// What's typed in each kid's timer controls, so the 10-second refresh doesn't wipe it
+const timerDrafts = new Map();
+
+function timerHtml(u) {
+  const t = u.timer;
+  const user = esc(u.user);
+  if (t && t.ended) {
+    return `<p class="timer-line">Timer ended at ${esc(clock(t.ends))} <button type="button" data-cancel-timer="${user}">Allow again</button></p>`;
+  }
+  if (t) {
+    const what = t.mode === "games" ? "closes games" : "locks the computer";
+    return `<p class="timer-line">Timer ends at ${esc(clock(t.ends))}: ${what} <button type="button" data-cancel-timer="${user}">Cancel</button></p>`;
+  }
+  const draft = timerDrafts.get(u.user) ?? {};
+  const mode = draft.mode ?? "lock";
+  return `
+      <form class="timer-form" data-user="${user}">
+        <span class="timer-label">Timer</span>
+        <button type="button" data-minutes="15">15m</button>
+        <button type="button" data-minutes="30">30m</button>
+        <button type="button" data-minutes="60">60m</button>
+        <input type="number" name="minutes" min="1" max="240" placeholder="min" aria-label="Minutes" value="${esc(draft.minutes ?? "")}">
+        <select name="mode" aria-label="When it ends">
+          <option value="lock" ${mode === "lock" ? "selected" : ""}>Lock computer</option>
+          <option value="games" ${mode === "games" ? "selected" : ""}>Close games</option>
+        </select>
+        <button type="submit">Start</button>
+        <p class="form-error" role="alert" hidden></p>
+      </form>`;
+}
+
 function cardHtml(u) {
   const running = u.sessions.filter((s) => s.state === "active" || s.state === "streaming").flatMap((s) => s.apps);
   const hosts = u.hosts_today.map((h) => `${esc(h.name)} ${duration(h.secs)}`).join(" · ");
@@ -167,6 +200,7 @@ function cardHtml(u) {
         <div><span class="hero-secondary">${duration(u.week_secs)}</span><span class="hero-label">last 7 days</span></div>
       </div>
       ${decisionHtml(u)}
+      ${timerHtml(u)}
       ${running.length ? `<ul class="running" aria-label="Running now">${running.map((a) => `<li>${esc(a)}</li>`).join("")}</ul>` : ""}
       <h3 class="section-title">Apps today</h3>
       ${appsHtml(u)}
@@ -252,6 +286,52 @@ document.getElementById("message-form").addEventListener("submit", async (e) => 
   }
 });
 
+async function startTimer(form, minutes) {
+  const user = form.dataset.user;
+  const error = form.querySelector(".form-error");
+  error.hidden = true;
+  const mode = form.elements.mode.value;
+  const buttons = [...form.querySelectorAll("button")];
+  buttons.forEach((b) => { b.disabled = true; });
+  try {
+    await api(`/api/timers/${encodeURIComponent(user)}`, { method: "POST", body: { minutes: Number(minutes), mode } });
+    timerDrafts.delete(user);
+    await refresh();
+  } catch (err) {
+    error.textContent = err.message || "Couldn't start the timer. Try again.";
+    error.hidden = false;
+    buttons.forEach((b) => { b.disabled = false; });
+  }
+}
+
+usersEl.addEventListener("click", async (e) => {
+  const preset = e.target.closest("[data-minutes]");
+  if (preset) return startTimer(preset.closest("form"), preset.dataset.minutes);
+  const cancel = e.target.closest("[data-cancel-timer]");
+  if (cancel) {
+    cancel.disabled = true;
+    try {
+      await api(`/api/timers/${encodeURIComponent(cancel.dataset.cancelTimer)}`, { method: "DELETE" });
+    } catch {
+      // Already gone (for example cancelled from another phone): the refresh shows the current state
+    }
+    await refresh();
+  }
+});
+
+usersEl.addEventListener("submit", (e) => {
+  const form = e.target.closest(".timer-form");
+  if (!form) return;
+  e.preventDefault();
+  if (!form.reportValidity()) return;
+  startTimer(form, form.elements.minutes.value);
+});
+
+usersEl.addEventListener("input", (e) => {
+  const form = e.target.closest(".timer-form");
+  if (form) timerDrafts.set(form.dataset.user, { minutes: form.elements.minutes.value, mode: form.elements.mode.value });
+});
+
 async function refresh() {
   try {
     const [status, events, messages] = await Promise.all([api("/api/status"), api("/api/events"), api("/api/messages").catch(() => null)]);
@@ -262,9 +342,12 @@ async function refresh() {
       appNames = new Map((await api("/api/apps").catch(() => [])).map((a) => [a.app_id, a.name]));
     }
     hideTip();
+    // Keep focus in a timer box across the redraw
+    const focused = document.activeElement?.closest?.(".timer-form") ? [document.activeElement.closest(".timer-form").dataset.user, document.activeElement.name] : null;
     usersEl.innerHTML = status.users.length
       ? status.users.map(cardHtml).join("")
       : '<article class="card"><p class="empty-note">No activity reported yet. Is an agent running?</p></article>';
+    if (focused) usersEl.querySelector(`.timer-form[data-user="${CSS.escape(focused[0])}"] [name="${focused[1]}"]`)?.focus();
     document.getElementById("events").innerHTML = eventsHtml(events);
     window.kidtimeUsers = status.users.map((u) => u.user);
     updateRecipients(window.kidtimeUsers);
