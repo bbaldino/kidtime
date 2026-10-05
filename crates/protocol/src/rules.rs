@@ -45,7 +45,14 @@ pub struct BlackoutSpan {
 pub enum Computer {
     Allowed,
     OutsideSchedule,
-    Blackout { until: NaiveDateTime, note: String },
+    Blackout {
+        until: NaiveDateTime,
+        note: String,
+    },
+    /// A timer the parent started has run out (lock mode).
+    TimerEnded {
+        at: NaiveDateTime,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -105,12 +112,50 @@ pub fn validate_blackout(start: NaiveDateTime, end: NaiveDateTime) -> Result<(),
     Ok(())
 }
 
+/// What stops when a timer runs out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TimerMode {
+    /// The computer locks, as outside allowed hours.
+    Lock,
+    /// Games close, as with a used-up games budget.
+    Games,
+}
+
+/// A stop the parent set for "N minutes from now". It only ever ends things sooner than the rules would.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Timer {
+    pub ends: NaiveDateTime,
+    pub mode: TimerMode,
+}
+
+impl Timer {
+    /// The stop lasts until the midnight after it ended (unless the parent lifts it first).
+    pub fn stop_until(&self) -> NaiveDateTime {
+        (self.ends.date() + Days::new(1)).and_time(NaiveTime::MIN)
+    }
+}
+
 pub fn decide(
     day: &DayRule,
     blackouts: &[BlackoutSpan],
     used_secs: &BTreeMap<CategoryId, i64>,
     now: NaiveDateTime,
 ) -> Decision {
+    decide_with_timer(day, blackouts, used_secs, None, now)
+}
+
+/// `decide`, with the parent's timer (if any) able to stop things sooner.
+pub fn decide_with_timer(
+    day: &DayRule,
+    blackouts: &[BlackoutSpan],
+    used_secs: &BTreeMap<CategoryId, i64>,
+    timer: Option<&Timer>,
+    now: NaiveDateTime,
+) -> Decision {
+    // A timer whose stop has passed no longer matters
+    let timer = timer.filter(|t| now < t.stop_until());
+    let ended = timer.is_some_and(|t| now >= t.ends);
     let midnight = now.date().and_time(NaiveTime::MIN);
     let minute = (now.time().num_seconds_from_midnight() / 60) as u16;
 
@@ -123,13 +168,16 @@ pub fn decide(
             .stretches
             .iter()
             .any(|s| s.start_min <= minute && minute < s.end_min);
-    let computer = match active {
-        Some(b) => Computer::Blackout {
+    let computer = match (active, timer) {
+        (Some(b), _) => Computer::Blackout {
             until: b.end,
             note: b.note.clone(),
         },
-        None if !in_stretch => Computer::OutsideSchedule,
-        None => Computer::Allowed,
+        (None, Some(t)) if ended && t.mode == TimerMode::Lock => {
+            Computer::TimerEnded { at: t.ends }
+        }
+        _ if !in_stretch => Computer::OutsideSchedule,
+        _ => Computer::Allowed,
     };
 
     // Tomorrow's rule takes over at midnight, so that is always a possible change
@@ -149,8 +197,12 @@ pub fn decide(
             consider(midnight + Duration::minutes(i64::from(s.end_min)));
         }
     }
+    if let Some(t) = timer {
+        consider(t.ends);
+        consider(t.stop_until());
+    }
 
-    let categories = day
+    let mut categories: Vec<CategoryStatus> = day
         .budgets
         .iter()
         .map(|(&category, &minutes)| {
@@ -164,6 +216,22 @@ pub fn decide(
             }
         })
         .collect();
+    // A games timer counts down the Games category too, budget or not; the sooner end wins
+    if let Some(t) = timer.filter(|t| t.mode == TimerMode::Games) {
+        let timer_left = (t.ends - now).num_seconds().max(0);
+        match categories.iter_mut().find(|c| c.category == GAMES) {
+            Some(c) => c.left_secs = c.left_secs.min(timer_left),
+            None => categories.push(CategoryStatus {
+                category: GAMES,
+                used_secs: used_secs.get(&GAMES).copied().unwrap_or(0),
+                left_secs: timer_left,
+                used_up: false,
+            }),
+        }
+        for c in categories.iter_mut().filter(|c| c.category == GAMES) {
+            c.used_up = c.left_secs == 0;
+        }
+    }
 
     Decision {
         computer,
@@ -197,6 +265,155 @@ mod tests {
 
     fn none() -> BTreeMap<CategoryId, i64> {
         BTreeMap::new()
+    }
+
+    fn lock_timer(ends: NaiveDateTime) -> Timer {
+        Timer {
+            ends,
+            mode: TimerMode::Lock,
+        }
+    }
+
+    fn games_timer(ends: NaiveDateTime) -> Timer {
+        Timer {
+            ends,
+            mode: TimerMode::Games,
+        }
+    }
+
+    #[test]
+    fn a_lock_timer_counts_down_then_locks_until_midnight() {
+        let t = lock_timer(at(19, 30));
+        let before = decide_with_timer(&DayRule::default(), &[], &none(), Some(&t), at(19, 0));
+        assert_eq!(before.computer, Computer::Allowed);
+        assert_eq!(before.next_change, at(19, 30));
+        let after = decide_with_timer(&DayRule::default(), &[], &none(), Some(&t), at(19, 30));
+        assert_eq!(after.computer, Computer::TimerEnded { at: at(19, 30) });
+        assert_eq!(after.next_change, at(0, 0) + Days::new(1));
+        let tomorrow = at(0, 0) + Days::new(1);
+        assert_eq!(
+            decide_with_timer(&DayRule::default(), &[], &none(), Some(&t), tomorrow).computer,
+            Computer::Allowed
+        );
+    }
+
+    #[test]
+    fn a_blackout_wins_over_an_ended_timer_which_wins_over_the_schedule() {
+        let t = lock_timer(at(18, 0));
+        let span = BlackoutSpan {
+            start: at(18, 30),
+            end: at(19, 0),
+            note: "dinner".into(),
+        };
+        let d = decide_with_timer(
+            &DayRule::default(),
+            std::slice::from_ref(&span),
+            &none(),
+            Some(&t),
+            at(18, 45),
+        );
+        assert_eq!(
+            d.computer,
+            Computer::Blackout {
+                until: at(19, 0),
+                note: "dinner".into()
+            }
+        );
+        let outside = day(&[(375, 1080)]); // allowed until 6pm
+        let d = decide_with_timer(&outside, &[], &none(), Some(&t), at(18, 10));
+        assert_eq!(d.computer, Computer::TimerEnded { at: at(18, 0) });
+    }
+
+    #[test]
+    fn an_earlier_bedtime_comes_first() {
+        let t = lock_timer(at(21, 30));
+        let d = decide_with_timer(&day(&[(375, 1260)]), &[], &none(), Some(&t), at(20, 50));
+        assert_eq!(d.next_change, at(21, 0));
+        assert_eq!(
+            decide_with_timer(&day(&[(375, 1260)]), &[], &none(), Some(&t), at(21, 10)).computer,
+            Computer::OutsideSchedule
+        );
+    }
+
+    #[test]
+    fn a_games_timer_counts_down_without_a_budget_and_then_uses_games_up() {
+        let t = games_timer(at(16, 30));
+        let d = decide_with_timer(&DayRule::default(), &[], &none(), Some(&t), at(16, 0));
+        assert_eq!(
+            d.categories,
+            vec![CategoryStatus {
+                category: GAMES,
+                used_secs: 0,
+                left_secs: 1800,
+                used_up: false
+            }]
+        );
+        assert_eq!(d.computer, Computer::Allowed);
+        let after = decide_with_timer(&DayRule::default(), &[], &none(), Some(&t), at(16, 30));
+        assert!(after.categories[0].used_up);
+        assert_eq!(after.computer, Computer::Allowed);
+    }
+
+    #[test]
+    fn a_games_timer_and_a_budget_count_to_whichever_is_sooner() {
+        let mut rule = DayRule::default();
+        rule.budgets.insert(GAMES, 60);
+        let used = BTreeMap::from([(GAMES, 600)]); // 50 minutes of budget left
+        let t = games_timer(at(16, 20));
+        let d = decide_with_timer(&rule, &[], &used, Some(&t), at(16, 0));
+        assert_eq!(d.categories[0].left_secs, 1200);
+        let late = games_timer(at(18, 0));
+        assert_eq!(
+            decide_with_timer(&rule, &[], &used, Some(&late), at(16, 0)).categories[0].left_secs,
+            3000
+        );
+    }
+
+    #[test]
+    fn a_timer_crossing_midnight_stops_until_the_following_midnight() {
+        let t = lock_timer(at(0, 20) + Days::new(1)); // started 11:50pm for 30 minutes
+        assert_eq!(t.stop_until(), at(0, 0) + Days::new(2));
+        let next = |h, m| at(h, m) + Days::new(1);
+        assert_eq!(
+            decide_with_timer(&DayRule::default(), &[], &none(), Some(&t), next(0, 10)).computer,
+            Computer::Allowed
+        );
+        assert!(matches!(
+            decide_with_timer(&DayRule::default(), &[], &none(), Some(&t), next(0, 20)).computer,
+            Computer::TimerEnded { .. }
+        ));
+        assert!(matches!(
+            decide_with_timer(&DayRule::default(), &[], &none(), Some(&t), next(23, 59)).computer,
+            Computer::TimerEnded { .. }
+        ));
+        assert_eq!(
+            decide_with_timer(
+                &DayRule::default(),
+                &[],
+                &none(),
+                Some(&t),
+                at(0, 0) + Days::new(2)
+            )
+            .computer,
+            Computer::Allowed
+        );
+    }
+
+    #[test]
+    fn timer_json_shape() {
+        let d = decide_with_timer(
+            &DayRule::default(),
+            &[],
+            &none(),
+            Some(&lock_timer(at(19, 30))),
+            at(20, 0),
+        );
+        let json = serde_json::to_value(&d).unwrap();
+        assert_eq!(json["computer"]["state"], "timer_ended");
+        assert_eq!(json["computer"]["at"], "2026-10-05T19:30:00");
+        let t: Timer =
+            serde_json::from_str(r#"{"ends":"2026-10-05T19:30:00","mode":"games"}"#).unwrap();
+        assert_eq!(t.mode, TimerMode::Games);
     }
 
     #[test]

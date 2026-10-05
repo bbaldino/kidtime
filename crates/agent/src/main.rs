@@ -763,6 +763,7 @@ mod tests {
                 used_secs: Default::default(),
                 games: vec![],
                 ignored: vec![],
+                timer: None,
                 for_day: now.date(),
             })
             .collect();

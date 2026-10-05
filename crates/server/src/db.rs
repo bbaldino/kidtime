@@ -139,6 +139,7 @@ fn decision_key(decision: &Decision) -> String {
         Computer::Allowed => "allowed",
         Computer::OutsideSchedule => "outside_schedule",
         Computer::Blackout { .. } => "blackout",
+        Computer::TimerEnded { .. } => "timer_ended",
     };
     let used_up: Vec<String> = decision
         .categories
@@ -771,6 +772,7 @@ impl Db {
             used_secs: self.category_secs(user, now.date())?,
             games: self.app_ids_in(GAMES)?,
             ignored: self.app_ids_in(IGNORED)?,
+            timer: None,
         })
     }
 
@@ -816,6 +818,7 @@ impl Db {
                     format!("blackout: {note}")
                 }
                 Computer::Blackout { .. } => "blackout".to_string(),
+                Computer::TimerEnded { .. } => "timer ended".to_string(),
                 _ => "outside schedule".to_string(),
             };
             ("locked", detail)

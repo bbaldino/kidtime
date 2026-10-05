@@ -854,6 +854,7 @@ mod tests {
             used_secs: BTreeMap::new(),
             games: vec!["steam:1".into()],
             ignored: vec!["kitty".into()],
+            timer: None,
         }
     }
 

@@ -85,6 +85,9 @@ pub struct AccountSnapshot {
     pub games: Vec<String>,
     /// App ids in the Ignored category: never counted.
     pub ignored: Vec<String>,
+    /// The parent's timer, if one is set and its stop hasn't passed.
+    #[serde(default)]
+    pub timer: Option<rules::Timer>,
 }
 
 impl UserState {
@@ -144,6 +147,7 @@ mod tests {
                 used_secs: BTreeMap::from([(rules::GAMES, 900)]),
                 games: vec!["steam:1".into()],
                 ignored: vec!["kitty".into()],
+                timer: None,
             }],
             messages: vec![Message {
                 id: 3,
@@ -156,6 +160,12 @@ mod tests {
             serde_json::from_str::<ReportResponse>(&json).unwrap(),
             response
         );
+
+        // A snapshot from a server that predates timers still parses
+        let mut old_snapshot = serde_json::to_value(&response.accounts[0]).unwrap();
+        old_snapshot.as_object_mut().unwrap().remove("timer");
+        let parsed: AccountSnapshot = serde_json::from_value(old_snapshot).unwrap();
+        assert_eq!(parsed.timer, None);
 
         // A response from a server that predates messages still parses
         let without: ReportResponse =
