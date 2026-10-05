@@ -80,7 +80,9 @@ function decisionHtml(u) {
   if (d.computer.state === "allowed") {
     // next_change is not always the moment the state flips, so only name a time when it isn't just midnight
     const midnight = d.next_change?.split("T")[1] === "00:00:00";
-    line = !d.next_change || midnight ? "Allowed" : `Allowed until ${esc(clock(d.next_change))}`;
+    // A games timer's end closes games but doesn't stop the computer: its own line says so
+    const gamesTimerEnd = u.timer?.mode === "games" && d.next_change === u.timer.ends;
+    line = !d.next_change || midnight || gamesTimerEnd ? "Allowed" : `Allowed until ${esc(clock(d.next_change))}`;
   } else if (d.computer.state === "blackout") line = `${locked}: blackout until ${esc(clock(d.computer.until))}${d.computer.note ? ` (${esc(d.computer.note)})` : ""}`;
   else if (d.computer.state === "timer_ended") line = `${locked}: timer ended at ${esc(clock(d.computer.at))}`;
   else line = `${locked}: outside allowed hours`;
@@ -93,9 +95,11 @@ function decisionHtml(u) {
 
 const EVENT_TEXT = {
   locked: (e) => `${e.enforced ? "Locked" : "Would have locked"}: ${e.detail}`,
-  closed: (e) => e.enforced
-    ? `Closed ${e.detail.toLowerCase()}: ${e.detail} budget used up`
-    : `Would have closed ${e.detail.toLowerCase()}: ${e.detail} budget used up`,
+  closed: (e) => e.detail === "timer ended"
+    ? `${e.enforced ? "Closed" : "Would have closed"} games: timer ended`
+    : e.enforced
+      ? `Closed ${e.detail.toLowerCase()}: ${e.detail} budget used up`
+      : `Would have closed ${e.detail.toLowerCase()}: ${e.detail} budget used up`,
   allowed: () => "Allowed again",
 };
 
@@ -164,28 +168,30 @@ const timerDrafts = new Map();
 function timerHtml(u) {
   const t = u.timer;
   const user = esc(u.user);
+  const draft = timerDrafts.get(u.user) ?? {};
+  const busy = draft.saving ? "disabled" : "";
+  const error = draft.error ? `<p class="form-error" role="alert">${esc(draft.error)}</p>` : "";
   if (t && t.ended) {
-    return `<p class="timer-line">Timer ended at ${esc(clock(t.ends))} <button type="button" data-cancel-timer="${user}">Allow again</button></p>`;
+    return `<p class="timer-line">Timer ended at ${esc(clock(t.ends))} (until midnight) <button type="button" data-cancel-timer="${user}" ${busy}>Allow again</button></p>${error}`;
   }
   if (t) {
     const what = t.mode === "games" ? "closes games" : "locks the computer";
-    return `<p class="timer-line">Timer ends at ${esc(clock(t.ends))}: ${what} <button type="button" data-cancel-timer="${user}">Cancel</button></p>`;
+    return `<p class="timer-line">Timer ends at ${esc(clock(t.ends))}: ${what} <button type="button" data-cancel-timer="${user}" ${busy}>Cancel</button></p>${error}`;
   }
-  const draft = timerDrafts.get(u.user) ?? {};
   const mode = draft.mode ?? "lock";
   return `
       <form class="timer-form" data-user="${user}">
         <span class="timer-label">Timer</span>
-        <button type="button" data-minutes="15">15m</button>
-        <button type="button" data-minutes="30">30m</button>
-        <button type="button" data-minutes="60">60m</button>
+        <button type="button" data-minutes="15" ${busy}>15m</button>
+        <button type="button" data-minutes="30" ${busy}>30m</button>
+        <button type="button" data-minutes="60" ${busy}>60m</button>
         <input type="number" name="minutes" min="1" max="240" placeholder="min" aria-label="Minutes" value="${esc(draft.minutes ?? "")}">
         <select name="mode" aria-label="When it ends">
           <option value="lock" ${mode === "lock" ? "selected" : ""}>Lock computer</option>
           <option value="games" ${mode === "games" ? "selected" : ""}>Close games</option>
         </select>
-        <button type="submit">Start</button>
-        <p class="form-error" role="alert" hidden></p>
+        <button type="submit" ${busy}>Start</button>
+        ${error}
       </form>`;
 }
 
@@ -286,22 +292,28 @@ document.getElementById("message-form").addEventListener("submit", async (e) => 
   }
 });
 
-async function startTimer(form, minutes) {
-  const user = form.dataset.user;
-  const error = form.querySelector(".form-error");
-  error.hidden = true;
-  const mode = form.elements.mode.value;
-  const buttons = [...form.querySelectorAll("button")];
-  buttons.forEach((b) => { b.disabled = true; });
+// Saving and error state live in timerDrafts, so the 10-second refresh keeps them on screen
+async function timerRequest(user, path, options, failure) {
+  const draft = timerDrafts.get(user) ?? {};
+  timerDrafts.set(user, { ...draft, saving: true, error: null });
+  await refresh();
   try {
-    await api(`/api/timers/${encodeURIComponent(user)}`, { method: "POST", body: { minutes: Number(minutes), mode } });
+    await api(path, options);
     timerDrafts.delete(user);
-    await refresh();
   } catch (err) {
-    error.textContent = err.message || "Couldn't start the timer. Try again.";
-    error.hidden = false;
-    buttons.forEach((b) => { b.disabled = false; });
+    timerDrafts.set(user, { ...(timerDrafts.get(user) ?? {}), saving: false, error: err.message || failure });
   }
+  await refresh();
+}
+
+function startTimer(form, minutes) {
+  const user = form.dataset.user;
+  return timerRequest(
+    user,
+    `/api/timers/${encodeURIComponent(user)}`,
+    { method: "POST", body: { minutes: Number(minutes), mode: form.elements.mode.value } },
+    "Couldn't start the timer. Try again.",
+  );
 }
 
 usersEl.addEventListener("click", async (e) => {
@@ -309,13 +321,11 @@ usersEl.addEventListener("click", async (e) => {
   if (preset) return startTimer(preset.closest("form"), preset.dataset.minutes);
   const cancel = e.target.closest("[data-cancel-timer]");
   if (cancel) {
-    cancel.disabled = true;
-    try {
-      await api(`/api/timers/${encodeURIComponent(cancel.dataset.cancelTimer)}`, { method: "DELETE" });
-    } catch {
-      // Already gone (for example cancelled from another phone): the refresh shows the current state
-    }
-    await refresh();
+    const user = cancel.dataset.cancelTimer;
+    // A 404 means it's already gone (for example cancelled from another phone): nothing to report
+    await timerRequest(user, `/api/timers/${encodeURIComponent(user)}`, { method: "DELETE" }, "Couldn't change the timer. Try again.")
+      .then(() => { if (/Not Found|HTTP 404/.test(timerDrafts.get(user)?.error ?? "")) timerDrafts.delete(user); })
+      .then(refresh);
   }
 });
 
@@ -329,7 +339,7 @@ usersEl.addEventListener("submit", (e) => {
 
 usersEl.addEventListener("input", (e) => {
   const form = e.target.closest(".timer-form");
-  if (form) timerDrafts.set(form.dataset.user, { minutes: form.elements.minutes.value, mode: form.elements.mode.value });
+  if (form) timerDrafts.set(form.dataset.user, { ...timerDrafts.get(form.dataset.user), minutes: form.elements.minutes.value, mode: form.elements.mode.value });
 });
 
 async function refresh() {

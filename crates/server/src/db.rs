@@ -821,7 +821,7 @@ impl Db {
         self.conn.execute(
             "INSERT INTO timer (user, started, ends, mode) VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT (user) DO UPDATE SET started = excluded.started, ends = excluded.ends, mode = excluded.mode",
-            params![user, Local::now().timestamp(), local_text(timer.ends), timer_mode_text(mode)],
+            params![user, now.and_local_timezone(Local).earliest().map_or(0, |t| t.timestamp()), local_text(timer.ends), timer_mode_text(mode)],
         )?;
         Ok(timer)
     }
@@ -898,7 +898,18 @@ impl Db {
         } else {
             let before: Vec<&str> = last_used_up.split(',').collect();
             let names = self.categories()?;
+            // Games used up because a games timer ended, not because of the budget
+            let at_local = Local.timestamp_opt(at, 0).single().map(|t| t.naive_local());
+            let games_timer_ended = match at_local {
+                Some(t) => self
+                    .timer(user, t)?
+                    .is_some_and(|timer| timer.mode == TimerMode::Games && t >= timer.ends),
+                None => false,
+            };
             let name_of = |id: CategoryId| {
+                if id == GAMES && games_timer_ended {
+                    return "timer ended".to_string();
+                }
                 names
                     .iter()
                     .find(|(known, _)| *known == id)
@@ -2255,6 +2266,47 @@ mod tests {
         assert!(db.cancel_timer("kid1").unwrap());
         assert!(!db.cancel_timer("kid1").unwrap());
         assert_eq!(db.timer("kid1", later).unwrap(), None);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn a_games_timer_ending_is_logged_as_closed_timer_ended() {
+        use protocol::rules::TimerMode;
+        let (mut db, path) = temp_db("games-timer-event");
+        let start = Local::now().naive_local() - chrono::Duration::minutes(10);
+        db.start_timer("kid1", 5, TimerMode::Games, start).unwrap();
+        let d = decision_of(Computer::Allowed, &[GAMES]);
+        db.log_decision("kid1", Local::now().timestamp(), &d, true, "host-a")
+            .unwrap();
+        let e = &db.events(Some("kid1"), 10).unwrap()[0];
+        assert_eq!(
+            (e.kind.as_str(), e.detail.as_str()),
+            ("closed", "timer ended")
+        );
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn a_new_timer_replaces_an_ended_one_and_lifts_its_stop() {
+        use protocol::rules::TimerMode;
+        let (mut db, path) = temp_db("timer-replace-ended");
+        let now = noon_today();
+        db.start_timer(
+            "kid1",
+            1,
+            TimerMode::Lock,
+            now - chrono::Duration::minutes(10),
+        )
+        .unwrap();
+        assert!(matches!(
+            db.decision("kid1", now).unwrap().computer,
+            Computer::TimerEnded { .. }
+        ));
+        db.start_timer("kid1", 30, TimerMode::Lock, now).unwrap();
+        assert_eq!(
+            db.decision("kid1", now).unwrap().computer,
+            Computer::Allowed
+        );
         std::fs::remove_file(&path).unwrap();
     }
 

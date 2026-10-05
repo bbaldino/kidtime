@@ -611,7 +611,13 @@ impl Enforcer {
                     .get(&GAMES)
                     .copied()
                     .unwrap_or(0);
-                let key = format!("games:{}:{budget}:{threshold}", now.date());
+                // A new games timer (or a changed budget) is a new countdown, and warns again
+                let timer_ends = snap
+                    .timer
+                    .as_ref()
+                    .filter(|t| t.mode == rules::TimerMode::Games)
+                    .map_or_else(|| "none".to_string(), |t| t.ends.to_string());
+                let key = format!("games:{}:{budget}:{timer_ends}:{threshold}", now.date());
                 let text = if threshold == 60 {
                     "1 minute of games left today: save your game".to_string()
                 } else {
@@ -628,7 +634,18 @@ impl Enforcer {
         let live = self.live.entry(user.clone()).or_default();
         if present && live.games_closed_on != Some(now.date()) {
             live.games_closed_on = Some(now.date());
-            act.notify(&user, "Games time is used up for today");
+            let timer_ended = snap
+                .timer
+                .as_ref()
+                .is_some_and(|t| t.mode == rules::TimerMode::Games && now >= t.ends);
+            act.notify(
+                &user,
+                if timer_ended {
+                    "Games time is up: the timer ended"
+                } else {
+                    "Games time is used up for today"
+                },
+            );
         }
         let mut overrun = Vec::new();
         for app in &o.running {
@@ -968,6 +985,49 @@ mod tests {
     }
 
     #[test]
+    fn a_second_games_timer_on_the_same_day_warns_again() {
+        use protocol::rules::{Timer, TimerMode};
+        let mut snap = snapshot("kid1", DayRule::default());
+        snap.timer = Some(Timer {
+            ends: at(15, 30),
+            mode: TimerMode::Games,
+        });
+        let mut e = enforcer(vec![snap.clone()], at(15, 0));
+        let mut fake = Fake::default();
+        e.tick(
+            at(15, 20),
+            &[obs("kid1", false, vec![app("steam:1")])],
+            &mut fake,
+        );
+        assert!(
+            fake.calls
+                .contains(&"notify kid1: 10 minutes of games left today".to_string())
+        );
+        fake.take();
+        snap.timer = Some(Timer {
+            ends: at(19, 30),
+            mode: TimerMode::Games,
+        });
+        e.apply_response(
+            &ReportResponse {
+                server_time: at(19, 0),
+                accounts: vec![snap],
+                messages: Vec::new(),
+            },
+            at(19, 0),
+        );
+        e.tick(
+            at(19, 20),
+            &[obs("kid1", false, vec![app("steam:1")])],
+            &mut fake,
+        );
+        assert!(
+            fake.calls
+                .contains(&"notify kid1: 10 minutes of games left today".to_string())
+        );
+    }
+
+    #[test]
     fn an_ended_games_timer_closes_games() {
         use protocol::rules::{Timer, TimerMode};
         let mut snap = snapshot("kid1", DayRule::default());
@@ -983,6 +1043,10 @@ mod tests {
             &mut fake,
         );
         assert!(fake.calls.contains(&"close kid1 steam:1".to_string()));
+        assert!(
+            fake.calls
+                .contains(&"notify kid1: Games time is up: the timer ended".to_string())
+        );
         assert!(
             !fake.calls.iter().any(|c| c.starts_with("disable")),
             "games mode doesn't lock"
