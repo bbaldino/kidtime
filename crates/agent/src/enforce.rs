@@ -223,7 +223,11 @@ impl Enforcer {
             let present = !o.sessions.is_empty() || !o.running.is_empty();
             if blocked {
                 let reason = blocked_reason(&snap, &decision, now);
-                banner.push(format!("{}: computer time is over {reason}", o.user));
+                banner.push(format!(
+                    "{}: computer time is over{}",
+                    o.user,
+                    joined(&reason)
+                ));
                 self.block(o, &reason, now, act);
             } else {
                 self.let_go(&o.user, act);
@@ -366,7 +370,7 @@ impl Enforcer {
         {
             *used.entry(GAMES).or_default() += live.local_secs;
         }
-        rules::decide(&day, &snap.blackouts, &used, now)
+        rules::decide_with_timer(&day, &snap.blackouts, &used, snap.timer.as_ref(), now)
     }
 
     fn block(&mut self, o: &Observation, reason: &str, now: NaiveDateTime, act: &mut dyn Actions) {
@@ -409,7 +413,7 @@ impl Enforcer {
         self.lock_sessions(now, user, &o.sessions, act);
         // After the locks, so nothing can delay them
         if first {
-            act.notify(user, &format!("Computer time is over {reason}"));
+            act.notify(user, &format!("Computer time is over{}", joined(reason)));
         }
         // Every blocked tick: the nftables table does not survive a reboot, and the rules may have been
         // removed or the kid's port changed. block_stream checks the rules and repairs only what is wrong.
@@ -667,12 +671,22 @@ fn nearest_threshold(left: i64) -> Option<i64> {
 }
 
 /// "until 6:15am", "until 7:00pm (dinner)", "until Tue 6:15am", or "for now" when nothing in the week allows it.
+/// A reason after "computer time is over": "until 6:15am" takes a space, ": timer ended …" doesn't.
+fn joined(reason: &str) -> String {
+    if reason.starts_with(':') {
+        reason.to_string()
+    } else {
+        format!(" {reason}")
+    }
+}
+
 fn blocked_reason(snap: &AccountSnapshot, d: &Decision, now: NaiveDateTime) -> String {
     match &d.computer {
         Computer::Blackout { until, note } if note.is_empty() => {
             format!("until {}", clock(*until, now))
         }
         Computer::Blackout { until, note } => format!("until {} ({note})", clock(*until, now)),
+        Computer::TimerEnded { at } => format!(": timer ended at {}", clock(*at, now)),
         _ => match next_allowed(snap, now) {
             Some(t) => format!("until {}", clock(t, now)),
             None => "for now".to_string(),
@@ -910,6 +924,69 @@ mod tests {
             running,
             streaming_host: false,
         }
+    }
+
+    #[test]
+    fn an_ended_lock_timer_blocks_and_says_so() {
+        use protocol::rules::{Timer, TimerMode};
+        let mut snap = snapshot("kid1", DayRule::default());
+        snap.timer = Some(Timer {
+            ends: at(19, 42),
+            mode: TimerMode::Lock,
+        });
+        let mut e = enforcer(vec![snap.clone()], at(19, 0));
+        let mut fake = Fake::default();
+        // Ten minutes out: the usual lock warning, counting to the timer
+        e.tick(at(19, 32), &[obs("kid1", false, vec![])], &mut fake);
+        assert!(fake.calls.contains(
+            &"notify kid1: 10 minutes left today: the computer locks at 7:42pm".to_string()
+        ));
+        fake.take();
+        e.tick(at(19, 42), &[obs("kid1", false, vec![])], &mut fake);
+        assert!(fake.calls.contains(&"disable kid1".to_string()));
+        assert!(
+            fake.calls
+                .contains(&"notify kid1: Computer time is over: timer ended at 7:42pm".to_string())
+        );
+        assert_eq!(
+            fake.banner,
+            ["kid1: computer time is over: timer ended at 7:42pm"]
+        );
+        // "Allow again": the next snapshot has no timer
+        snap.timer = None;
+        e.apply_response(
+            &ReportResponse {
+                server_time: at(19, 50),
+                accounts: vec![snap],
+                messages: Vec::new(),
+            },
+            at(19, 50),
+        );
+        fake.take();
+        e.tick(at(19, 50), &[obs("kid1", true, vec![])], &mut fake);
+        assert!(fake.calls.contains(&"enable kid1".to_string()));
+    }
+
+    #[test]
+    fn an_ended_games_timer_closes_games() {
+        use protocol::rules::{Timer, TimerMode};
+        let mut snap = snapshot("kid1", DayRule::default());
+        snap.timer = Some(Timer {
+            ends: at(16, 30),
+            mode: TimerMode::Games,
+        });
+        let mut e = enforcer(vec![snap], at(16, 0));
+        let mut fake = Fake::default();
+        e.tick(
+            at(16, 30),
+            &[obs("kid1", false, vec![app("steam:1")])],
+            &mut fake,
+        );
+        assert!(fake.calls.contains(&"close kid1 steam:1".to_string()));
+        assert!(
+            !fake.calls.iter().any(|c| c.starts_with("disable")),
+            "games mode doesn't lock"
+        );
     }
 
     #[test]
