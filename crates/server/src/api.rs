@@ -55,6 +55,18 @@ pub(crate) fn invalid(field: &'static str, message: &str) -> ApiError {
 
 type Api<T> = Result<T, ApiError>;
 
+/// The day a `?day=YYYY-MM-DD` asks for, or today without one. A day that hasn't happened is refused.
+pub(crate) fn parse_day(text: Option<&str>) -> Api<chrono::NaiveDate> {
+    let today = Local::now().date_naive();
+    let Some(text) = text else { return Ok(today) };
+    let day = chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d")
+        .map_err(|_| invalid("day", "The day must look like 2026-10-05."))?;
+    if day > today {
+        return Err(invalid("day", "That day hasn't happened yet."));
+    }
+    Ok(day)
+}
+
 fn check_weekday(weekday: u8) -> Api<()> {
     if weekday > 6 {
         Err(invalid(
@@ -358,6 +370,32 @@ pub async fn get_messages(
     State(state): State<Arc<AppState>>,
 ) -> Api<Json<Vec<crate::db::MessageRow>>> {
     Ok(Json(state.db.lock().unwrap().recent_messages(20)?))
+}
+
+#[derive(Deserialize)]
+pub struct DayQuery {
+    /// `YYYY-MM-DD`; today when left out.
+    pub(crate) day: Option<String>,
+}
+
+/// One account's timeline for a day: which app was in use when.
+pub async fn get_timeline(
+    State(state): State<Arc<AppState>>,
+    Path(user): Path<String>,
+    Query(query): Query<DayQuery>,
+) -> Api<Json<serde_json::Value>> {
+    let day = parse_day(query.day.as_deref())?;
+    let db = state.db.lock().unwrap();
+    if !db.is_account(&user)? {
+        return Err(ApiError::NotFound);
+    }
+    let (start, end) = crate::db::Db::day_bounds(day);
+    Ok(Json(json!({
+        "day": day,
+        "start": start,
+        "end": end,
+        "blocks": db.timeline(&user, day)?,
+    })))
 }
 
 pub async fn get_events(
@@ -799,6 +837,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn timeline_gives_a_days_blocks_and_leaves_out_ignored_apps() {
+        let app = app("timeline");
+        // Two minutes of a game and a terminal, two days ago
+        let at = chrono::Local::now().timestamp() - 2 * 86_400;
+        let samples: Vec<Value> = (0..8)
+            .map(|i| {
+                json!({ "seq": i + 1, "at": at + i * 15, "elapsed_secs": 15, "users": [{
+                    "user": "kid1", "state": "active",
+                    "apps": [{ "id": "steam:1", "name": "Some Game" }, { "id": "term", "name": "Terminal" }],
+                }]})
+            })
+            .collect();
+        let body =
+            json!({ "host": "host-a", "agent_id": "t", "interval_secs": 15, "samples": samples });
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/report")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer token")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        router(app.state.clone()).oneshot(request).await.unwrap();
+        let ignore = json!({ "category_id": 2 });
+        call(&app, "PUT", "/api/apps/term", Some(ignore)).await;
+
+        let day = chrono::DateTime::from_timestamp(at, 0)
+            .unwrap()
+            .with_timezone(&chrono::Local)
+            .date_naive();
+        let (code, timeline) =
+            call(&app, "GET", &format!("/api/timeline/kid1?day={day}"), None).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(timeline["day"], day.to_string());
+        assert!(timeline["start"].as_i64().unwrap() <= at);
+        assert!(timeline["end"].as_i64().unwrap() > at);
+        let blocks = timeline["blocks"].as_array().unwrap();
+        // A sample covers the 15 seconds up to its time; near midnight part of it may fall on another day
+        assert_eq!(blocks.len(), 1, "{blocks:?}");
+        assert_eq!(blocks[0]["name"], "Some Game");
+        assert_eq!(blocks[0]["hosts"], json!(["host-a"]));
+        let (start, end) = (
+            blocks[0]["start"].as_i64().unwrap(),
+            blocks[0]["end"].as_i64().unwrap(),
+        );
+        assert!((60..=120).contains(&(end - start)), "{start}..{end}");
+
+        // Today has nothing; an unknown account and a bad day are refused
+        let (code, today) = call(&app, "GET", "/api/timeline/kid1", None).await;
+        assert_eq!(code, StatusCode::OK);
+        assert!(today["blocks"].as_array().unwrap().is_empty());
+        let (code, _) = call(&app, "GET", "/api/timeline/nobody", None).await;
+        assert_eq!(code, StatusCode::NOT_FOUND);
+        let (code, body) = call(&app, "GET", "/api/timeline/kid1?day=soon", None).await;
+        assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["field"], "day");
+    }
+
+    #[tokio::test]
     async fn status_refuses_a_day_that_is_malformed_or_in_the_future() {
         let app = app("status-bad-day");
         let tomorrow = (chrono::Local::now() + chrono::Duration::days(1)).date_naive();
@@ -1232,6 +1328,7 @@ mod tests {
             ("GET", "/manage.js"),
             ("GET", "/manifest.webmanifest"),
             ("GET", "/api/status"),
+            ("GET", "/api/timeline/kid1"),
             ("GET", "/api/rules/kid1"),
             ("PUT", "/api/rules/kid1/0"),
             ("PUT", "/api/accounts/kid1/enforce"),

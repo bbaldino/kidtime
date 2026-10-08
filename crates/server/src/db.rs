@@ -203,6 +203,73 @@ pub struct AppUsage {
     pub secs: i64,
 }
 
+/// One block on a day's timeline: an app in use from `start` to `end` (unix seconds).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TimelineBlock {
+    pub name: String,
+    pub start: i64,
+    pub end: i64,
+    /// The computers it ran on during the block, sorted.
+    pub hosts: Vec<String>,
+}
+
+/// One recorded stretch of an app on one computer.
+pub struct AppStretch {
+    pub app_id: String,
+    pub name: String,
+    pub host: String,
+    pub start: i64,
+    pub end: i64,
+}
+
+/// A pause shorter than this doesn't split a timeline block, and a block shorter than this is left out.
+const TIMELINE_MIN_SECS: i64 = 60;
+
+/// Turns recorded stretches into timeline blocks for the day `day_start..day_end`: computers are merged,
+/// pauses under a minute are bridged, blocks under a minute are dropped, and blocks are cut at the day's
+/// edges. Sorted by start, then name.
+pub fn timeline_blocks(
+    mut stretches: Vec<AppStretch>,
+    day_start: i64,
+    day_end: i64,
+) -> Vec<TimelineBlock> {
+    stretches.sort_by(|a, b| (&a.app_id, a.start).cmp(&(&b.app_id, b.start)));
+    let mut blocks: Vec<(String, TimelineBlock)> = Vec::new();
+    for s in stretches {
+        let (start, end) = (s.start.max(day_start), s.end.min(day_end));
+        if end <= start {
+            continue;
+        }
+        match blocks.last_mut() {
+            Some((app_id, last)) if *app_id == s.app_id && start - last.end < TIMELINE_MIN_SECS => {
+                last.end = last.end.max(end);
+                if !last.hosts.contains(&s.host) {
+                    last.hosts.push(s.host);
+                }
+            }
+            _ => blocks.push((
+                s.app_id,
+                TimelineBlock {
+                    name: s.name,
+                    start,
+                    end,
+                    hosts: vec![s.host],
+                },
+            )),
+        }
+    }
+    let mut blocks: Vec<TimelineBlock> = blocks
+        .into_iter()
+        .map(|(_, mut b)| {
+            b.hosts.sort();
+            b
+        })
+        .filter(|b| b.end - b.start >= TIMELINE_MIN_SECS)
+        .collect();
+    blocks.sort_by(|a, b| (a.start, &a.name).cmp(&(b.start, &b.name)));
+    blocks
+}
+
 impl Db {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(dir) = path.parent() {
@@ -511,6 +578,42 @@ impl Db {
             })?
             .collect::<Result<_, _>>()?;
         Ok(rows)
+    }
+
+    /// The day's timeline for one account: which app was in use when, leaving out Ignored apps. Names are
+    /// the ones `app_totals` gives for that day, so the two can be matched up.
+    pub fn timeline(&self, user: &str, day: NaiveDate) -> Result<Vec<TimelineBlock>> {
+        let (day_start, day_end) = (midnight(day), midnight(day + Days::new(1)));
+        let mut stmt = self.conn.prepare(
+            "SELECT a.app_id,
+                    COALESCE((SELECT MAX(u.app_name) FROM usage u
+                              WHERE u.user = a.user AND u.app_id = a.app_id AND u.day = ?4),
+                             app.name, a.app_id),
+                    a.host, a.start, a.end
+             FROM app_activity a LEFT JOIN app ON app.app_id = a.app_id
+             WHERE a.user = ?1 AND a.end > ?2 AND a.start < ?3
+               AND (app.category_id IS NULL OR app.category_id != ?5)",
+        )?;
+        let stretches = stmt
+            .query_map(
+                params![user, day_start, day_end, day.to_string(), IGNORED],
+                |r| {
+                    Ok(AppStretch {
+                        app_id: r.get(0)?,
+                        name: r.get(1)?,
+                        host: r.get(2)?,
+                        start: r.get(3)?,
+                        end: r.get(4)?,
+                    })
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(timeline_blocks(stretches, day_start, day_end))
+    }
+
+    /// The unix seconds at which `day` starts and ends in the server's time zone.
+    pub fn day_bounds(day: NaiveDate) -> (i64, i64) {
+        (midnight(day), midnight(day + Days::new(1)))
     }
 
     /// Ids of apps in the Ignored category.
@@ -1112,6 +1215,99 @@ fn merge(intervals: Vec<(i64, i64)>) -> Vec<(i64, i64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn stretch(app_id: &str, host: &str, start: i64, end: i64) -> AppStretch {
+        AppStretch {
+            app_id: app_id.into(),
+            name: app_id.to_uppercase(),
+            host: host.into(),
+            start,
+            end,
+        }
+    }
+
+    fn block(name: &str, start: i64, end: i64, hosts: &[&str]) -> TimelineBlock {
+        TimelineBlock {
+            name: name.into(),
+            start,
+            end,
+            hosts: hosts.iter().map(|h| h.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn timeline_bridges_short_pauses_and_keeps_long_ones() {
+        let blocks = timeline_blocks(
+            vec![
+                stretch("a", "host-a", 1000, 1300),
+                // 59 seconds later: the same block
+                stretch("a", "host-a", 1359, 1600),
+                // 60 seconds later: a new one
+                stretch("a", "host-a", 1660, 2000),
+            ],
+            0,
+            86_400,
+        );
+        assert_eq!(
+            blocks,
+            [
+                block("A", 1000, 1600, &["host-a"]),
+                block("A", 1660, 2000, &["host-a"])
+            ]
+        );
+    }
+
+    #[test]
+    fn timeline_merges_computers_and_keeps_apps_apart() {
+        let blocks = timeline_blocks(
+            vec![
+                stretch("b", "host-a", 500, 900),
+                stretch("a", "host-b", 1200, 1800),
+                stretch("a", "host-a", 1000, 1500),
+                // Entirely inside the block from the other computer
+                stretch("a", "host-b", 1300, 1400),
+            ],
+            0,
+            86_400,
+        );
+        assert_eq!(
+            blocks,
+            [
+                block("B", 500, 900, &["host-a"]),
+                block("A", 1000, 1800, &["host-a", "host-b"])
+            ]
+        );
+    }
+
+    #[test]
+    fn timeline_drops_blips_and_cuts_at_the_days_edges() {
+        let blocks = timeline_blocks(
+            vec![
+                // Under a minute, even after bridging its two halves
+                stretch("blip", "host-a", 5000, 5020),
+                stretch("blip", "host-a", 5030, 5055),
+                // Exactly a minute stays
+                stretch("short", "host-a", 6000, 6060),
+                // Started yesterday, ends tomorrow
+                stretch("late", "host-a", -500, 400),
+                stretch("night", "host-a", 86_000, 90_000),
+                // Only 30 seconds of it are today
+                stretch("edge", "host-a", 86_370, 87_000),
+                // Not today at all
+                stretch("gone", "host-a", 90_000, 95_000),
+            ],
+            0,
+            86_400,
+        );
+        assert_eq!(
+            blocks,
+            [
+                block("LATE", 0, 400, &["host-a"]),
+                block("SHORT", 6000, 6060, &["host-a"]),
+                block("NIGHT", 86_000, 86_400, &["host-a"]),
+            ]
+        );
+    }
 
     fn report(agent_id: &str, seqs: &[u64], state: UserState) -> Report {
         report_from("pc", agent_id, seqs, state, start_of_test())

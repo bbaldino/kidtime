@@ -145,6 +145,7 @@ pub(crate) fn router(state: Arc<AppState>) -> Router {
         .route("/api/apps/{id}", put(api::put_app))
         .route("/api/categories", get(api::get_categories))
         .route("/api/events", get(api::get_events))
+        .route("/api/timeline/{user}", get(api::get_timeline))
         .route(
             "/api/messages",
             get(api::get_messages).post(api::post_message),
@@ -403,30 +404,14 @@ fn presence(state: UserState) -> u8 {
     }
 }
 
-#[derive(Deserialize)]
-struct StatusQuery {
-    /// `YYYY-MM-DD`; today when left out.
-    day: Option<String>,
-}
-
 /// Usage figures are for the day asked for (today by default) and the six days before it. The live
 /// parts (state, sessions, decision, timer) are always the current ones.
 async fn status(
     State(state): State<Arc<AppState>>,
-    Query(query): Query<StatusQuery>,
+    Query(query): Query<api::DayQuery>,
 ) -> Result<Json<Status>, api::ApiError> {
     let today = Local::now().date_naive();
-    let day = match query.day {
-        None => today,
-        Some(text) => {
-            let day = NaiveDate::parse_from_str(&text, "%Y-%m-%d")
-                .map_err(|_| api::invalid("day", "The day must look like 2026-10-05."))?;
-            if day > today {
-                return Err(api::invalid("day", "That day hasn't happened yet."));
-            }
-            day
-        }
-    };
+    let day = api::parse_day(query.day.as_deref())?;
     let first_day = day
         .checked_sub_days(Days::new(HISTORY_DAYS - 1))
         .ok_or_else(|| api::invalid("day", "That day is too long ago."))?;

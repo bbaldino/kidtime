@@ -128,6 +128,10 @@ function statusHtml(u) {
   return `<span class="status ${s.tone}"><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true">${ICONS[s.icon]}</svg>${esc(s.label(u.host ?? ""))}</span>`;
 }
 
+// An app's colour is its place among the day's top apps, shared by the bars and the timeline
+const COLOURED_APPS = 5;
+const seriesColour = (rank) => (rank >= 0 && rank < COLOURED_APPS ? `var(--series-${rank + 1})` : "var(--series-other)");
+
 function appsHtml(u, past) {
   if (!u.apps_today.length) return `<p class="empty-note">No app time ${past ? "that day" : "today"}.</p>`;
   let apps = u.apps_today;
@@ -137,13 +141,51 @@ function appsHtml(u, past) {
   }
   // Apps run side by side, so each bar is its share of today's total
   const scale = Math.max(u.today_secs, ...apps.map((a) => a.secs), 1);
-  const rows = apps.map((a) => `
+  const rows = apps.map((a, i) => `
     <li class="bar-row" title="${esc(a.name)}: ${duration(a.secs)}">
       <span class="bar-name">${esc(a.name)}</span>
-      <span class="bar-track"><span class="bar-fill" style="display:block;width:${(100 * a.secs / scale).toFixed(1)}%"></span></span>
+      <span class="bar-track"><span class="bar-fill" style="display:block;width:${(100 * a.secs / scale).toFixed(1)}%;background:${seriesColour(i)}"></span></span>
       <span class="bar-value">${duration(a.secs)}</span>
     </li>`).join("");
   return `<ul class="bars">${rows}</ul>`;
+}
+
+const HOUR = 3600;
+const timeOfDay = (t) => new Date(t * 1000).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+const hourLabel = (t) => new Date(t * 1000).toLocaleTimeString([], { hour: "numeric" }).replace(/\s/g, "").toLowerCase();
+
+// Which app was in use when: a row per top app plus "Other", from the first to the last activity of the day
+function timelineHtml(u) {
+  const t = u.timeline;
+  if (!t) return '<p class="empty-note">Couldn\'t load the timeline.</p>';
+  if (!t.blocks.length) {
+    const kept = Date.now() / 1000 - t.end < 30 * 86400;
+    return `<p class="empty-note">${kept ? "Nothing to show." : "Timelines are kept for 30 days."}</p>`;
+  }
+  // Whole hours around the activity, inside the day
+  const from = Math.max(t.start, Math.floor(Math.min(...t.blocks.map((b) => b.start)) / HOUR) * HOUR);
+  const to = Math.min(t.end, Math.ceil(Math.max(...t.blocks.map((b) => b.end)) / HOUR) * HOUR);
+  const span = Math.max(to - from, 1);
+  const pct = (secs) => (100 * secs / span).toFixed(2);
+
+  const top = u.apps_today.slice(0, COLOURED_APPS).map((a) => a.name);
+  const rows = top.map((name, i) => ({ name, colour: seriesColour(i), blocks: t.blocks.filter((b) => b.name === name) }));
+  rows.push({ name: "Other", colour: seriesColour(-1), blocks: t.blocks.filter((b) => !top.includes(b.name)) });
+
+  const rowsHtml = rows.filter((r) => r.blocks.length).map((r) => {
+    const blocks = r.blocks.map((b) => {
+      const tip = `${b.name} · ${timeOfDay(b.start)}–${timeOfDay(b.end)} · ${b.hosts.join(", ")}`;
+      return `<span class="tl-block" tabindex="0" style="left:${pct(b.start - from)}%;width:${pct(b.end - b.start)}%;background:${r.colour}" data-tip="${esc(tip)}" data-value="${duration(b.end - b.start)}" aria-label="${esc(tip)}: ${duration(b.end - b.start)}"></span>`;
+    }).join("");
+    return `<div class="tl-row"><span class="tl-name">${esc(r.name)}</span><span class="tl-track">${blocks}</span></div>`;
+  }).join("");
+
+  // At most about six hour labels
+  const hours = Math.round(span / HOUR);
+  const step = [1, 2, 3, 4, 6, 12, 24].find((s) => hours / s <= 6) ?? 24;
+  let ticks = "";
+  for (let at = from; at <= to; at += step * HOUR) ticks += `<span${at === to ? ' class="tl-end"' : ""} style="left:${pct(at - from)}%">${esc(hourLabel(at))}</span>`;
+  return `<div class="timeline">${rowsHtml}<div class="tl-axis" aria-hidden="true">${ticks}</div></div>`;
 }
 
 function weekHtml(u) {
@@ -212,6 +254,8 @@ function pastCardHtml(u, day) {
       </div>
       <h3 class="section-title">Apps that day</h3>
       ${appsHtml(u, true)}
+      <h3 class="section-title">Timeline</h3>
+      ${timelineHtml(u)}
       <h3 class="section-title">7 days to ${esc(dayLabel(day))}</h3>
       ${weekHtml(u)}
       ${hosts ? `<p class="hosts">By computer: ${hosts}</p>` : ""}
@@ -233,6 +277,8 @@ function cardHtml(u) {
       ${running.length ? `<ul class="running" aria-label="Running now">${running.map((a) => `<li>${esc(a)}</li>`).join("")}</ul>` : ""}
       <h3 class="section-title">Apps today</h3>
       ${appsHtml(u)}
+      <h3 class="section-title">Timeline</h3>
+      ${timelineHtml(u)}
       <h3 class="section-title">Last 7 days</h3>
       ${weekHtml(u)}
       ${hosts ? `<p class="hosts">Today by computer: ${hosts}</p>` : ""}
@@ -246,22 +292,24 @@ function showTip(el) {
   tipTarget?.classList.remove("active");
   tipTarget = el;
   el.classList.add("active");
-  tooltip.innerHTML = `${el.dataset.tip} · <strong>${el.dataset.value}</strong>`;
+  tooltip.innerHTML = `${esc(el.dataset.tip)} · <strong>${esc(el.dataset.value)}</strong>`;
   const r = el.getBoundingClientRect();
   tooltip.hidden = false;
   const half = tooltip.offsetWidth / 2 + 8;
   tooltip.style.left = `${Math.min(Math.max(r.left + r.width / 2, half), window.innerWidth - half)}px`;
-  tooltip.style.top = `${r.top + r.height - (el.firstElementChild?.offsetHeight ?? 0)}px`;
+  // Above a chart column's filled part, or above a timeline block
+  tooltip.style.top = `${el.firstElementChild ? r.top + r.height - el.firstElementChild.offsetHeight : r.top}px`;
 }
 function hideTip() {
   tipTarget?.classList.remove("active");
   tipTarget = null;
   tooltip.hidden = true;
 }
-document.addEventListener("pointerover", (e) => { const d = e.target.closest?.(".day"); if (d && e.pointerType === "mouse") showTip(d); });
-document.addEventListener("pointerout", (e) => { if (e.pointerType === "mouse" && e.target.closest?.(".day")) hideTip(); });
+const TIPPED = ".day, .tl-block";
+document.addEventListener("pointerover", (e) => { const d = e.target.closest?.(TIPPED); if (d && e.pointerType === "mouse") showTip(d); });
+document.addEventListener("pointerout", (e) => { if (e.pointerType === "mouse" && e.target.closest?.(TIPPED)) hideTip(); });
 document.addEventListener("click", (e) => {
-  const d = e.target.closest?.(".day");
+  const d = e.target.closest?.(TIPPED);
   if (d?.dataset.day) return showDay(d.dataset.day);
   d && d !== tipTarget ? showTip(d) : hideTip();
 });
@@ -271,7 +319,7 @@ document.addEventListener("keydown", (e) => {
     showDay(e.target.dataset.day);
   }
 });
-document.addEventListener("focusin", (e) => { if (e.target.classList?.contains("day")) showTip(e.target); });
+document.addEventListener("focusin", (e) => { if (e.target.matches?.(TIPPED)) showTip(e.target); });
 document.addEventListener("focusout", hideTip);
 window.addEventListener("scroll", hideTip, { passive: true });
 
@@ -375,6 +423,15 @@ usersEl.addEventListener("input", (e) => {
   if (form) timerDrafts.set(form.dataset.user, { ...timerDrafts.get(form.dataset.user), minutes: form.elements.minutes.value, mode: form.elements.mode.value });
 });
 
+// Each account's timeline for the day; a failed fetch leaves that card's timeline saying so
+async function withTimelines(status, day) {
+  const query = day ? `?day=${encodeURIComponent(day)}` : "";
+  await Promise.all(status.users.map(async (u) => {
+    u.timeline = await api(`/api/timeline/${encodeURIComponent(u.user)}${query}`).catch(() => null);
+  }));
+  return status;
+}
+
 // The day on show: null is today (and stays today over midnight), otherwise "2026-10-05"
 let viewDay = null;
 let serverToday = null;
@@ -415,7 +472,7 @@ function renderDayBar(status) {
 }
 
 async function refreshPast(day, turn) {
-  const status = await api(`/api/status?day=${encodeURIComponent(day)}`);
+  const status = await withTimelines(await api(`/api/status?day=${encodeURIComponent(day)}`), day);
   // A slower answer for a day no longer on show is dropped
   if (turn !== refreshes) return;
   hideTip();
@@ -432,6 +489,7 @@ async function refresh() {
   try {
     if (viewDay) return await refreshPast(viewDay, turn);
     const [status, events, messages] = await Promise.all([api("/api/status"), api("/api/events"), api("/api/messages").catch(() => null)]);
+    await withTimelines(status, null);
     if (turn !== refreshes) return;
     renderDayBar(status);
     // Without the names the cards still render; the next refresh asks again

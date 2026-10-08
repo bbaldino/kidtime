@@ -8,6 +8,11 @@
   --text-muted: #7a7974;
   --track: #ecebe7;
   --series-1: #2a78d6;
+  --series-2: #eb6834;
+  --series-3: #1baf7a;
+  --series-4: #eda100;
+  --series-5: #e87ba4;
+  --series-other: #9a9994;
   --status-good: #0ca30c;
   --status-warning: #fab219;
   --status-neutral: #9a9994;
@@ -26,6 +31,11 @@
     --text-muted: #8f8e86;
     --track: #262624;
     --series-1: #3987e5;
+    --series-2: #d95926;
+    --series-3: #199e70;
+    --series-4: #c98500;
+    --series-5: #d55181;
+    --series-other: #6f6e69;
     --status-neutral: #6f6e69;
   }
 }
@@ -255,3 +265,16 @@ main { max-width: 960px; margin: 0 auto; }
 .day-bar button, .day-bar input { font: inherit; padding: 6px 10px; min-height: 36px; }
 .day-bar input { flex: 0 1 11em; min-width: 0; }
 .day[data-day] { cursor: pointer; }
+.timeline { display: grid; gap: 6px; }
+.tl-row { display: grid; gap: 2px; }
+.tl-name { font-size: 0.8rem; color: var(--text-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tl-track { position: relative; height: 14px; background: var(--track); border-radius: 4px; }
+.tl-block { position: absolute; top: 0; bottom: 0; min-width: 3px; border-radius: 3px; box-shadow: 0 0 0 1px var(--surface); }
+.tl-block:hover, .tl-block.active { filter: brightness(1.12); }
+/* A bigger target than the thin block, for fingers */
+.tl-block::after { content: ""; position: absolute; inset: -8px -3px; }
+.tl-axis { position: relative; height: 1.1em; font-size: 0.7rem; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+.tl-axis span { position: absolute; transform: translateX(-50%); white-space: nowrap; }
+.tl-axis span:first-child { transform: none; }
+.tl-axis span.tl-end { transform: translateX(-100%); }
+.tooltip { max-width: calc(100vw - 16px); overflow: hidden; text-overflow: ellipsis; }
