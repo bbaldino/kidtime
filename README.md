@@ -127,8 +127,10 @@ The dashboard has three tabs.
   done, while Enforce is off).
   The date bar at the top (arrows, date picker, or a tap on a chart column) shows an earlier day's usage:
   the total, time per app and time per computer, read-only.
-  Each card also has a **Timeline** of which app was in use when (kept for 30 days); tap a block for its
-  times and the computer.
+  Each card also has a **Timeline** of which app was in use when (kept for 30 days): one strip of numbered
+  blocks with a key giving each block's start time, app and length. One app is shown at a time (a game over
+  anything else, otherwise the one started most recently), with anything else running listed after a "+".
+  Breaks of over an hour are folded into a dashed gap. Tap a block for its times and the computer.
   It also has **Send a message**: a note to one kid or everyone, shown as a notification on the computer
   they're using within about 15 seconds (or in their stream), and dropped if they aren't at a computer within 10 minutes.
   Each kid's card has a **timer**: 15, 30 or 60 minutes (or any length up to 4 hours), then either the computer

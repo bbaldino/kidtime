@@ -265,16 +265,23 @@ main { max-width: 960px; margin: 0 auto; }
 .day-bar button, .day-bar input { font: inherit; padding: 6px 10px; min-height: 36px; }
 .day-bar input { flex: 0 1 11em; min-width: 0; }
 .day[data-day] { cursor: pointer; }
-.timeline { display: grid; gap: 6px; }
-.tl-row { display: grid; gap: 2px; }
-.tl-name { font-size: 0.8rem; color: var(--text-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.tl-track { position: relative; height: 14px; background: var(--track); border-radius: 4px; }
-.tl-block { position: absolute; top: 0; bottom: 0; min-width: 3px; border-radius: 3px; box-shadow: 0 0 0 1px var(--surface); }
+.timeline { display: grid; }
+.tl-nums { position: relative; height: 1.3em; margin-bottom: 2px; font-size: 0.7rem; font-weight: 600; color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+.tl-nums span { position: absolute; transform: translateX(-50%); }
+.tl-track { position: relative; height: 26px; background: var(--track); border-radius: 5px; }
+.tl-block { position: absolute; top: 0; bottom: 0; min-width: 3px; border-radius: 4px; box-shadow: 0 0 0 1px var(--surface); }
 .tl-block:hover, .tl-block.active { filter: brightness(1.12); }
-/* A bigger target than the thin block, for fingers */
-.tl-block::after { content: ""; position: absolute; inset: -8px -3px; }
-.tl-axis { position: relative; height: 1.1em; font-size: 0.7rem; color: var(--text-muted); font-variant-numeric: tabular-nums; }
-.tl-axis span { position: absolute; transform: translateX(-50%); white-space: nowrap; }
-.tl-axis span:first-child { transform: none; }
+.tl-block.active { outline: 2px solid var(--text-primary); outline-offset: 1px; z-index: 1; }
+.tl-fold { position: absolute; top: 0; bottom: 0; background: var(--surface); border-left: 1px dashed var(--text-muted); border-right: 1px dashed var(--text-muted); }
+.tl-axis { position: relative; height: 1.2em; margin-top: 3px; font-size: 0.7rem; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+.tl-axis span { position: absolute; white-space: nowrap; }
 .tl-axis span.tl-end { transform: translateX(-100%); }
+.tl-key { list-style: none; margin: 10px 0 0; padding: 0; display: grid; gap: 5px; font-size: 0.85rem; }
+.tl-key li { display: grid; grid-template-columns: 1.3em 10px 4.4em minmax(0, 1fr) auto; gap: 7px; align-items: center; }
+.tl-num { font-weight: 600; color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+.tl-swatch { width: 10px; height: 10px; border-radius: 3px; }
+.tl-start { font-weight: 600; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.tl-app { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tl-app small { color: var(--text-muted); font-size: inherit; }
+.tl-length { color: var(--text-secondary); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .tooltip { max-width: calc(100vw - 16px); overflow: hidden; text-overflow: ellipsis; }

@@ -158,10 +158,13 @@ Agent config: see `deploy/agent.toml.example`. A streaming host sets `streaming_
 - Days are counted in the server's local time zone, so `TZ` for the container must match the kids' PCs.
 - The dashboard (`crates/server/static/`) is vanilla JS with no build step. It polls `/api/status` every 10s.
   It has three tabs: Today, Rules and Apps. The Rules and Apps tabs are in `manage.js`.
-  - Each card has a Timeline: a row per top-5 app plus "Other", coloured to match the per-app bars (categorical
-    slots 1-5 of the dataviz palette, grey for the rest), from `GET /api/timeline/{user}?day=`. The server merges
-    computers, bridges pauses under a minute and drops blocks under a minute (`db::timeline_blocks`). It reads
-    `app_activity`, so it only goes back 30 days.
+  - Each card has a Timeline: one strip of numbered blocks and a key (start time, app, anything else running,
+    length), from `GET /api/timeline/{user}?day=`. Blocks are coloured to match the per-app bars (categorical
+    slots 1-5 of the dataviz palette, grey for the rest). The server merges computers, bridges pauses under a
+    minute and drops blocks under a minute (`db::timeline_blocks`), then shows one app at any moment
+    (`db::timeline_strip`: a game over anything else, otherwise the most recently started; the rest go in `also`).
+    The client folds breaks of over an hour into a dashed gap, so the strip isn't to scale across the day.
+    It reads `app_activity`, so it only goes back 30 days.
   - The Today tab has a date bar (previous/next, date picker, Today), and a chart column jumps to its day.
     A past day is read-only usage: no status, running apps, timer, message box or rules log.
   - Designed for phones first, with two columns on wide screens and separate light and dark colors.

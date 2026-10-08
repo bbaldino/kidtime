@@ -152,9 +152,13 @@ function appsHtml(u, past) {
 
 const HOUR = 3600;
 const timeOfDay = (t) => new Date(t * 1000).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
-const hourLabel = (t) => new Date(t * 1000).toLocaleTimeString([], { hour: "numeric" }).replace(/\s/g, "").toLowerCase();
+const shortTime = (t) => timeOfDay(t).replace(/\s/g, "").toLowerCase();
 
-// Which app was in use when: a row per top app plus "Other", from the first to the last activity of the day
+// Percent of the strip's width a folded break takes
+const TL_FOLD = 3.5;
+
+// Which app was in use when: one strip of numbered blocks, and a key naming each one. A break of over
+// an hour is folded into a narrow gap, so the strip isn't to scale across the whole day.
 function timelineHtml(u) {
   const t = u.timeline;
   if (!t) return '<p class="empty-note">Couldn\'t load the timeline.</p>';
@@ -162,30 +166,59 @@ function timelineHtml(u) {
     const kept = Date.now() / 1000 - t.end < 30 * 86400;
     return `<p class="empty-note">${kept ? "Nothing to show." : "Timelines are kept for 30 days."}</p>`;
   }
-  // Whole hours around the activity, inside the day
-  const from = Math.max(t.start, Math.floor(Math.min(...t.blocks.map((b) => b.start)) / HOUR) * HOUR);
-  const to = Math.min(t.end, Math.ceil(Math.max(...t.blocks.map((b) => b.end)) / HOUR) * HOUR);
-  const span = Math.max(to - from, 1);
-  const pct = (secs) => (100 * secs / span).toFixed(2);
+  const spans = [];
+  for (const b of t.blocks) {
+    const last = spans[spans.length - 1];
+    if (last && b.start - last.end <= HOUR) last.end = Math.max(last.end, b.end);
+    else spans.push({ start: b.start, end: b.end });
+  }
+  const secs = spans.reduce((sum, s) => sum + (s.end - s.start), 0);
+  const room = 100 - TL_FOLD * (spans.length - 1);
+  let left = 0;
+  for (const s of spans) {
+    s.x = left;
+    s.w = room * (s.end - s.start) / secs;
+    left += s.w + TL_FOLD;
+  }
+  const x = (at) => {
+    const s = spans.find((s) => at >= s.start && at <= s.end);
+    return s.x + s.w * (at - s.start) / Math.max(s.end - s.start, 1);
+  };
 
-  const top = u.apps_today.slice(0, COLOURED_APPS).map((a) => a.name);
-  const rows = top.map((name, i) => ({ name, colour: seriesColour(i), blocks: t.blocks.filter((b) => b.name === name) }));
-  rows.push({ name: "Other", colour: seriesColour(-1), blocks: t.blocks.filter((b) => !top.includes(b.name)) });
+  const ranks = new Map(u.apps_today.map((a, i) => [a.name, i]));
+  const colour = (b) => seriesColour(ranks.get(b.name) ?? -1);
+  let blocks = "", nums = "", key = "", lastNum = -100;
+  t.blocks.forEach((b, i) => {
+    const [from, to] = [x(b.start), x(b.end)];
+    const length = duration(b.end - b.start);
+    const tip = `${i + 1} · ${b.name} · ${timeOfDay(b.start)}–${timeOfDay(b.end)} · ${b.hosts.join(", ")}`;
+    blocks += `<span class="tl-block" tabindex="0" style="left:${from.toFixed(2)}%;width:${(to - from).toFixed(2)}%;background:${colour(b)}" data-tip="${esc(tip)}" data-value="${length}" aria-label="${esc(tip)}: ${length}"></span>`;
+    // A number too close to the one before is left out; the block's tooltip still gives it
+    const mid = (from + to) / 2;
+    if (mid - lastNum >= 4.5) {
+      nums += `<span style="left:${mid.toFixed(2)}%">${i + 1}</span>`;
+      lastNum = mid;
+    }
+    const also = b.also.length ? ` <small>+ ${b.also.map(esc).join(", ")}</small>` : "";
+    key += `<li><span class="tl-num">${i + 1}</span><span class="tl-swatch" style="background:${colour(b)}"></span><span class="tl-start">${esc(shortTime(b.start))}</span><span class="tl-app">${esc(b.name)}${also}</span><span class="tl-length">${length}</span></li>`;
+  });
+  const folds = spans.slice(0, -1).map((s) => `<span class="tl-fold" style="left:${(s.x + s.w).toFixed(2)}%;width:${TL_FOLD}%"></span>`).join("");
 
-  const rowsHtml = rows.filter((r) => r.blocks.length).map((r) => {
-    const blocks = r.blocks.map((b) => {
-      const tip = `${b.name} · ${timeOfDay(b.start)}–${timeOfDay(b.end)} · ${b.hosts.join(", ")}`;
-      return `<span class="tl-block" tabindex="0" style="left:${pct(b.start - from)}%;width:${pct(b.end - b.start)}%;background:${r.colour}" data-tip="${esc(tip)}" data-value="${duration(b.end - b.start)}" aria-label="${esc(tip)}: ${duration(b.end - b.start)}"></span>`;
-    }).join("");
-    return `<div class="tl-row"><span class="tl-name">${esc(r.name)}</span><span class="tl-track">${blocks}</span></div>`;
-  }).join("");
-
-  // At most about six hour labels
-  const hours = Math.round(span / HOUR);
-  const step = [1, 2, 3, 4, 6, 12, 24].find((s) => hours / s <= 6) ?? 24;
-  let ticks = "";
-  for (let at = from; at <= to; at += step * HOUR) ticks += `<span${at === to ? ' class="tl-end"' : ""} style="left:${pct(at - from)}%">${esc(hourLabel(at))}</span>`;
-  return `<div class="timeline">${rowsHtml}<div class="tl-axis" aria-hidden="true">${ticks}</div></div>`;
+  // A time under the start of each stretch, skipping any that would run into its neighbours
+  let ticks = "", lastTick = -100;
+  spans.forEach((s) => {
+    if (s.x - lastTick < 14 || s.x > 84) return;
+    ticks += `<span style="left:${s.x.toFixed(2)}%">${esc(shortTime(s.start))}</span>`;
+    lastTick = s.x;
+  });
+  ticks += `<span class="tl-end" style="left:100%">${esc(shortTime(spans[spans.length - 1].end))}</span>`;
+  const note = spans.length > 1 ? '<p class="footnote">Dashed gaps are breaks of over an hour, not to scale.</p>' : "";
+  return `<div class="timeline">
+      <div class="tl-nums" aria-hidden="true">${nums}</div>
+      <div class="tl-track">${blocks}${folds}</div>
+      <div class="tl-axis" aria-hidden="true">${ticks}</div>
+      <ol class="tl-key">${key}</ol>${note}
+    </div>`;
 }
 
 function weekHtml(u) {

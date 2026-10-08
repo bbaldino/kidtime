@@ -203,7 +203,19 @@ pub struct AppUsage {
     pub secs: i64,
 }
 
-/// One block on a day's timeline: an app in use from `start` to `end` (unix seconds).
+/// One app in use from `start` to `end` (unix seconds), on any computer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppBlock {
+    pub name: String,
+    /// Whether the app is in the Games category.
+    pub game: bool,
+    pub start: i64,
+    pub end: i64,
+    /// The computers it ran on during the block, sorted.
+    pub hosts: Vec<String>,
+}
+
+/// One block on a day's timeline: the app shown from `start` to `end` (unix seconds).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TimelineBlock {
     pub name: String,
@@ -211,12 +223,15 @@ pub struct TimelineBlock {
     pub end: i64,
     /// The computers it ran on during the block, sorted.
     pub hosts: Vec<String>,
+    /// Other apps that were also in use at some point during the block, sorted.
+    pub also: Vec<String>,
 }
 
 /// One recorded stretch of an app on one computer.
 pub struct AppStretch {
     pub app_id: String,
     pub name: String,
+    pub game: bool,
     pub host: String,
     pub start: i64,
     pub end: i64,
@@ -225,16 +240,16 @@ pub struct AppStretch {
 /// A pause shorter than this doesn't split a timeline block, and a block shorter than this is left out.
 const TIMELINE_MIN_SECS: i64 = 60;
 
-/// Turns recorded stretches into timeline blocks for the day `day_start..day_end`: computers are merged,
+/// Turns recorded stretches into per-app blocks for the day `day_start..day_end`: computers are merged,
 /// pauses under a minute are bridged, blocks under a minute are dropped, and blocks are cut at the day's
 /// edges. Sorted by start, then name.
 pub fn timeline_blocks(
     mut stretches: Vec<AppStretch>,
     day_start: i64,
     day_end: i64,
-) -> Vec<TimelineBlock> {
+) -> Vec<AppBlock> {
     stretches.sort_by(|a, b| (&a.app_id, a.start).cmp(&(&b.app_id, b.start)));
-    let mut blocks: Vec<(String, TimelineBlock)> = Vec::new();
+    let mut blocks: Vec<(String, AppBlock)> = Vec::new();
     for s in stretches {
         let (start, end) = (s.start.max(day_start), s.end.min(day_end));
         if end <= start {
@@ -249,8 +264,9 @@ pub fn timeline_blocks(
             }
             _ => blocks.push((
                 s.app_id,
-                TimelineBlock {
+                AppBlock {
                     name: s.name,
+                    game: s.game,
                     start,
                     end,
                     hosts: vec![s.host],
@@ -258,7 +274,7 @@ pub fn timeline_blocks(
             )),
         }
     }
-    let mut blocks: Vec<TimelineBlock> = blocks
+    let mut blocks: Vec<AppBlock> = blocks
         .into_iter()
         .map(|(_, mut b)| {
             b.hosts.sort();
@@ -268,6 +284,60 @@ pub fn timeline_blocks(
         .collect();
     blocks.sort_by(|a, b| (a.start, &a.name).cmp(&(b.start, &b.name)));
     blocks
+}
+
+/// Flattens per-app blocks into one strip, where a single app is shown at any moment. When several were
+/// in use at once, a game is shown over anything else, and otherwise the one started most recently (the
+/// nearest thing to "what they switched to" that is recorded). The others are listed in `also`. Pieces
+/// shorter than a minute are left out.
+pub fn timeline_strip(blocks: &[AppBlock]) -> Vec<TimelineBlock> {
+    let mut edges: Vec<i64> = blocks.iter().flat_map(|b| [b.start, b.end]).collect();
+    edges.sort_unstable();
+    edges.dedup();
+    let mut strip: Vec<(usize, TimelineBlock)> = Vec::new();
+    for pair in edges.windows(2) {
+        let (start, end) = (pair[0], pair[1]);
+        let running = || {
+            blocks
+                .iter()
+                .enumerate()
+                .filter(move |(_, b)| b.start <= start && b.end >= end)
+        };
+        let Some((shown, block)) = running()
+            .max_by(|(_, a), (_, b)| (a.game, a.start, &b.name).cmp(&(b.game, b.start, &a.name)))
+        else {
+            continue;
+        };
+        let others = running()
+            .filter(|(i, _)| *i != shown)
+            .map(|(_, b)| b.name.clone());
+        match strip.last_mut() {
+            Some((last, piece)) if *last == shown && piece.end == start => {
+                piece.end = end;
+                piece.also.extend(others);
+            }
+            _ => strip.push((
+                shown,
+                TimelineBlock {
+                    name: block.name.clone(),
+                    start,
+                    end,
+                    hosts: block.hosts.clone(),
+                    also: others.collect(),
+                },
+            )),
+        }
+    }
+    strip
+        .into_iter()
+        .map(|(_, mut piece)| {
+            piece.also.sort();
+            piece.also.dedup();
+            piece.also.retain(|name| *name != piece.name);
+            piece
+        })
+        .filter(|piece| piece.end - piece.start >= TIMELINE_MIN_SECS)
+        .collect()
 }
 
 impl Db {
@@ -580,8 +650,8 @@ impl Db {
         Ok(rows)
     }
 
-    /// The day's timeline for one account: which app was in use when, leaving out Ignored apps. Names are
-    /// the ones `app_totals` gives for that day, so the two can be matched up.
+    /// The day's timeline for one account: which app was in use when (see `timeline_strip`), leaving out
+    /// Ignored apps. Names are the ones `app_totals` gives for that day, so the two can be matched up.
     pub fn timeline(&self, user: &str, day: NaiveDate) -> Result<Vec<TimelineBlock>> {
         let (day_start, day_end) = (midnight(day), midnight(day + Days::new(1)));
         let mut stmt = self.conn.prepare(
@@ -589,6 +659,7 @@ impl Db {
                     COALESCE((SELECT MAX(u.app_name) FROM usage u
                               WHERE u.user = a.user AND u.app_id = a.app_id AND u.day = ?4),
                              app.name, a.app_id),
+                    COALESCE(app.category_id = ?6, 0),
                     a.host, a.start, a.end
              FROM app_activity a LEFT JOIN app ON app.app_id = a.app_id
              WHERE a.user = ?1 AND a.end > ?2 AND a.start < ?3
@@ -596,19 +667,22 @@ impl Db {
         )?;
         let stretches = stmt
             .query_map(
-                params![user, day_start, day_end, day.to_string(), IGNORED],
+                params![user, day_start, day_end, day.to_string(), IGNORED, GAMES],
                 |r| {
                     Ok(AppStretch {
                         app_id: r.get(0)?,
                         name: r.get(1)?,
-                        host: r.get(2)?,
-                        start: r.get(3)?,
-                        end: r.get(4)?,
+                        game: r.get(2)?,
+                        host: r.get(3)?,
+                        start: r.get(4)?,
+                        end: r.get(5)?,
                     })
                 },
             )?
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(timeline_blocks(stretches, day_start, day_end))
+        Ok(timeline_strip(&timeline_blocks(
+            stretches, day_start, day_end,
+        )))
     }
 
     /// The unix seconds at which `day` starts and ends in the server's time zone.
@@ -1220,19 +1294,87 @@ mod tests {
         AppStretch {
             app_id: app_id.into(),
             name: app_id.to_uppercase(),
+            game: app_id.starts_with("game"),
             host: host.into(),
             start,
             end,
         }
     }
 
-    fn block(name: &str, start: i64, end: i64, hosts: &[&str]) -> TimelineBlock {
-        TimelineBlock {
+    fn block(name: &str, start: i64, end: i64, hosts: &[&str]) -> AppBlock {
+        AppBlock {
             name: name.into(),
+            game: name.starts_with("GAME"),
             start,
             end,
             hosts: hosts.iter().map(|h| h.to_string()).collect(),
         }
+    }
+
+    fn piece(name: &str, start: i64, end: i64, also: &[&str]) -> TimelineBlock {
+        TimelineBlock {
+            name: name.into(),
+            start,
+            end,
+            hosts: vec!["host-a".into()],
+            also: also.iter().map(|a| a.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn strip_shows_a_game_over_other_apps_and_lists_them() {
+        // A browser open all along, a game in the middle of it
+        let strip = timeline_strip(&[
+            block("BROWSER", 0, 3000, &["host-a"]),
+            block("GAME1", 1000, 2000, &["host-a"]),
+        ]);
+        assert_eq!(
+            strip,
+            [
+                piece("BROWSER", 0, 1000, &[]),
+                piece("GAME1", 1000, 2000, &["BROWSER"]),
+                piece("BROWSER", 2000, 3000, &[]),
+            ]
+        );
+    }
+
+    #[test]
+    fn strip_shows_the_most_recently_started_of_two_alike() {
+        // Two games overlap: the later one shows while both run; the same for two other apps
+        let strip = timeline_strip(&[
+            block("GAME1", 0, 2000, &["host-a"]),
+            block("GAME2", 1000, 3000, &["host-a"]),
+            block("CHAT", 5000, 7000, &["host-a"]),
+            block("BROWSER", 6000, 6500, &["host-a"]),
+        ]);
+        assert_eq!(
+            strip,
+            [
+                piece("GAME1", 0, 1000, &[]),
+                piece("GAME2", 1000, 3000, &["GAME1"]),
+                piece("CHAT", 5000, 6000, &[]),
+                piece("BROWSER", 6000, 6500, &["CHAT"]),
+                piece("CHAT", 6500, 7000, &[]),
+            ]
+        );
+    }
+
+    #[test]
+    fn strip_leaves_out_slivers_and_keeps_gaps() {
+        // The launcher shows for 30 seconds before the game takes over: too short to draw
+        let strip = timeline_strip(&[
+            block("LAUNCHER", 0, 1000, &["host-a"]),
+            block("GAME1", 30, 1000, &["host-a"]),
+            block("GAME1", 4000, 5000, &["host-a"]),
+        ]);
+        assert_eq!(
+            strip,
+            [
+                piece("GAME1", 30, 1000, &["LAUNCHER"]),
+                piece("GAME1", 4000, 5000, &[]),
+            ]
+        );
+        assert!(timeline_strip(&[]).is_empty());
     }
 
     #[test]
