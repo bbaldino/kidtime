@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.0](https://github.com/bbaldino/kidtime/compare/v0.7.0...v0.8.0) (2026-10-08)
+
+
+### Features
+
+* **dashboard:** browse previous days ([0c9ac17](https://github.com/bbaldino/kidtime/commit/0c9ac173965b9e7829fbb675f1d821dde7198485))
+
 ## [0.7.0](https://github.com/bbaldino/kidtime/compare/v0.6.0...v0.7.0) (2026-10-05)
 
 
