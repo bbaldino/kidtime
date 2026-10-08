@@ -9,12 +9,12 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use chrono::{Days, Local};
+use chrono::{Days, Local, NaiveDate};
 use protocol::{Report, UserSample, UserState};
 use serde::{Deserialize, Serialize};
 
@@ -335,6 +335,10 @@ async fn report(
 #[derive(Serialize)]
 struct Status {
     generated_at: i64,
+    /// The day the usage figures are for.
+    day: NaiveDate,
+    /// The server's current day: the latest one that can be asked for.
+    today: NaiveDate,
     users: Vec<UserStatus>,
 }
 
@@ -399,15 +403,36 @@ fn presence(state: UserState) -> u8 {
     }
 }
 
-async fn status(State(state): State<Arc<AppState>>) -> Result<Json<Status>, StatusCode> {
+#[derive(Deserialize)]
+struct StatusQuery {
+    /// `YYYY-MM-DD`; today when left out.
+    day: Option<String>,
+}
+
+/// Usage figures are for the day asked for (today by default) and the six days before it. The live
+/// parts (state, sessions, decision, timer) are always the current ones.
+async fn status(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<StatusQuery>,
+) -> Result<Json<Status>, api::ApiError> {
     let today = Local::now().date_naive();
-    let first_day = today - Days::new(HISTORY_DAYS - 1);
+    let day = match query.day {
+        None => today,
+        Some(text) => {
+            let day = NaiveDate::parse_from_str(&text, "%Y-%m-%d")
+                .map_err(|_| api::invalid("day", "The day must look like 2026-10-05."))?;
+            if day > today {
+                return Err(api::invalid("day", "That day hasn't happened yet."));
+            }
+            day
+        }
+    };
+    let first_day = day
+        .checked_sub_days(Days::new(HISTORY_DAYS - 1))
+        .ok_or_else(|| api::invalid("day", "That day is too long ago."))?;
     let now = now();
 
-    let ignored = state.db.lock().unwrap().ignored_app_ids().map_err(|e| {
-        tracing::error!("status query: {e:#}");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let ignored = state.db.lock().unwrap().ignored_app_ids()?;
 
     // Live sessions per user, ignoring hosts that have gone quiet, and leaving out ignored apps
     let mut sessions: HashMap<String, Vec<HostSession>> = HashMap::new();
@@ -446,10 +471,13 @@ async fn status(State(state): State<Arc<AppState>>) -> Result<Json<Status>, Stat
     let db = state.db.lock().unwrap();
     let internal = |e: anyhow::Error| {
         tracing::error!("status query: {e:#}");
-        StatusCode::INTERNAL_SERVER_ERROR
+        api::ApiError::Internal
     };
-    let mut names: Vec<String> = db.users_since(first_day).map_err(internal)?;
-    names.extend(sessions.keys().cloned());
+    let mut names: Vec<String> = db.users_between(first_day, day).map_err(internal)?;
+    // Someone at a computer now belongs on today's page even before any time is recorded
+    if day == today {
+        names.extend(sessions.keys().cloned());
+    }
     names.sort();
     names.dedup();
 
@@ -469,7 +497,7 @@ async fn status(State(state): State<Arc<AppState>>) -> Result<Json<Status>, Stat
             });
 
         let days: Vec<NamedSecs> = db
-            .daily_totals(&name, first_day, today)
+            .daily_totals(&name, first_day, day)
             .map_err(internal)?
             .into_iter()
             .map(|(day, secs)| NamedSecs {
@@ -513,7 +541,7 @@ async fn status(State(state): State<Arc<AppState>>) -> Result<Json<Status>, Stat
             today_secs: days.last().map_or(0, |d| d.secs),
             week_secs: days.iter().map(|d| d.secs).sum(),
             apps_today: db
-                .app_totals(&name, today)
+                .app_totals(&name, day)
                 .map_err(internal)?
                 .into_iter()
                 .map(|a| NamedSecs {
@@ -522,7 +550,7 @@ async fn status(State(state): State<Arc<AppState>>) -> Result<Json<Status>, Stat
                 })
                 .collect(),
             hosts_today: db
-                .host_totals(&name, today)
+                .host_totals(&name, day)
                 .map_err(internal)?
                 .into_iter()
                 .map(|(name, secs)| NamedSecs { name, secs })
@@ -534,6 +562,8 @@ async fn status(State(state): State<Arc<AppState>>) -> Result<Json<Status>, Stat
     }
     Ok(Json(Status {
         generated_at: now,
+        day,
+        today,
         users,
     }))
 }

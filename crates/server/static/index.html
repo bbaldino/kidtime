@@ -26,8 +26,14 @@
   </nav>
   <main>
     <section id="tab-today">
+      <div class="day-bar">
+        <button type="button" id="day-prev" aria-label="Previous day">‹</button>
+        <input type="date" id="day-pick" aria-label="Day shown">
+        <button type="button" id="day-next" aria-label="Next day">›</button>
+        <button type="button" id="day-today" hidden>Today</button>
+      </div>
       <div id="users" class="users"></div>
-      <section class="card log">
+      <section class="card log" data-today-only>
         <h2>Send a message</h2>
         <form id="message-form" class="editor">
           <label>To <select name="to" id="message-to"></select></label>
@@ -38,7 +44,7 @@
         <p class="footnote">Shown on the computer they're using, within about 15 seconds. Not shown after 10 minutes if they aren't at a computer.</p>
         <ul id="messages" class="events"></ul>
       </section>
-      <section class="card log">
+      <section class="card log" data-today-only>
         <h2>What the rules did</h2>
         <p class="footnote">Kids with Enforce on are acted on. For the others this shows when kidtime would have acted.</p>
         <ul id="events" class="events"></ul>

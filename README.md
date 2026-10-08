@@ -125,6 +125,8 @@ The dashboard has three tabs.
 
 - **Today** shows each kid's usage, what the rules say right now, and a log of what kidtime did (or would have
   done, while Enforce is off).
+  The date bar at the top (arrows, date picker, or a tap on a chart column) shows an earlier day's usage:
+  the total, time per app and time per computer, read-only.
   It also has **Send a message**: a note to one kid or everyone, shown as a notification on the computer
   they're using within about 15 seconds (or in their stream), and dropped if they aren't at a computer within 10 minutes.
   Each kid's card has a **timer**: 15, 30 or 60 minutes (or any length up to 4 hours), then either the computer

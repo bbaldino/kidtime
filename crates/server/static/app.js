@@ -128,8 +128,8 @@ function statusHtml(u) {
   return `<span class="status ${s.tone}"><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true">${ICONS[s.icon]}</svg>${esc(s.label(u.host ?? ""))}</span>`;
 }
 
-function appsHtml(u) {
-  if (!u.apps_today.length) return '<p class="empty-note">No app time today.</p>';
+function appsHtml(u, past) {
+  if (!u.apps_today.length) return `<p class="empty-note">No app time ${past ? "that day" : "today"}.</p>`;
   let apps = u.apps_today;
   if (apps.length > MAX_APPS) {
     const rest = apps.slice(MAX_APPS - 1);
@@ -152,7 +152,9 @@ function weekHtml(u) {
     const date = parseDay(d.name);
     const label = date.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" });
     const pct = (100 * d.secs / max).toFixed(1);
-    return `<div class="day${d.secs ? "" : " empty"}" data-tip="${esc(label)}" data-value="${duration(d.secs)}" tabindex="0" aria-label="${esc(label)}: ${duration(d.secs)}">
+    // Every column but the last (the day on show) jumps to its day
+    const jump = i === u.days.length - 1 ? "" : ` data-day="${esc(d.name)}"`;
+    return `<div class="day${d.secs ? "" : " empty"}"${jump} data-tip="${esc(label)}" data-value="${duration(d.secs)}" tabindex="0" aria-label="${esc(label)}: ${duration(d.secs)}">
       <div class="day-fill" style="height:${d.secs ? pct : 0}%"></div></div>`;
   }).join("");
   const labels = u.days.map((d, i) => {
@@ -193,6 +195,27 @@ function timerHtml(u) {
         <button type="submit" ${busy}>Start</button>
         ${error}
       </form>`;
+}
+
+// "Mon, Oct 5" for a day like "2026-10-05"
+const dayLabel = (day) => parseDay(day).toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" });
+
+// A past day's card: that day's usage only, with nothing live and nothing to change
+function pastCardHtml(u, day) {
+  const hosts = u.hosts_today.map((h) => `${esc(h.name)} ${duration(h.secs)}`).join(" · ");
+  return `
+    <article class="card">
+      <div class="card-head"><h2>${esc(u.user)}</h2></div>
+      <div class="hero">
+        <div><span class="hero-value">${duration(u.today_secs)}</span><span class="hero-label">${esc(dayLabel(day))}</span></div>
+        <div><span class="hero-secondary">${duration(u.week_secs)}</span><span class="hero-label">7 days to then</span></div>
+      </div>
+      <h3 class="section-title">Apps that day</h3>
+      ${appsHtml(u, true)}
+      <h3 class="section-title">7 days to ${esc(dayLabel(day))}</h3>
+      ${weekHtml(u)}
+      ${hosts ? `<p class="hosts">By computer: ${hosts}</p>` : ""}
+    </article>`;
 }
 
 function cardHtml(u) {
@@ -237,7 +260,17 @@ function hideTip() {
 }
 document.addEventListener("pointerover", (e) => { const d = e.target.closest?.(".day"); if (d && e.pointerType === "mouse") showTip(d); });
 document.addEventListener("pointerout", (e) => { if (e.pointerType === "mouse" && e.target.closest?.(".day")) hideTip(); });
-document.addEventListener("click", (e) => { const d = e.target.closest?.(".day"); d && d !== tipTarget ? showTip(d) : hideTip(); });
+document.addEventListener("click", (e) => {
+  const d = e.target.closest?.(".day");
+  if (d?.dataset.day) return showDay(d.dataset.day);
+  d && d !== tipTarget ? showTip(d) : hideTip();
+});
+document.addEventListener("keydown", (e) => {
+  if ((e.key === "Enter" || e.key === " ") && e.target.classList?.contains("day") && e.target.dataset.day) {
+    e.preventDefault();
+    showDay(e.target.dataset.day);
+  }
+});
 document.addEventListener("focusin", (e) => { if (e.target.classList?.contains("day")) showTip(e.target); });
 document.addEventListener("focusout", hideTip);
 window.addEventListener("scroll", hideTip, { passive: true });
@@ -342,9 +375,65 @@ usersEl.addEventListener("input", (e) => {
   if (form) timerDrafts.set(form.dataset.user, { ...timerDrafts.get(form.dataset.user), minutes: form.elements.minutes.value, mode: form.elements.mode.value });
 });
 
+// The day on show: null is today (and stays today over midnight), otherwise "2026-10-05"
+let viewDay = null;
+let serverToday = null;
+let refreshes = 0;
+const dayPick = document.getElementById("day-pick");
+const dayText = (date) => `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+
+function showDay(day) {
+  viewDay = day && day !== serverToday ? day : null;
+  return refresh();
+}
+
+function stepDay(by) {
+  const date = parseDay(viewDay ?? serverToday ?? dayText(new Date()));
+  date.setDate(date.getDate() + by);
+  const day = dayText(date);
+  // Never past the server's today
+  if (!serverToday || day <= serverToday) showDay(day);
+}
+
+document.getElementById("day-prev").addEventListener("click", () => stepDay(-1));
+document.getElementById("day-next").addEventListener("click", () => stepDay(1));
+document.getElementById("day-today").addEventListener("click", () => showDay(null));
+dayPick.addEventListener("change", () => {
+  // Cleared, or typed past the limit: back to today
+  const day = dayPick.value;
+  showDay(day && (!serverToday || day <= serverToday) ? day : null);
+});
+
+function renderDayBar(status) {
+  serverToday = status.today;
+  const past = status.day !== status.today;
+  dayPick.max = status.today;
+  if (document.activeElement !== dayPick) dayPick.value = status.day;
+  document.getElementById("day-next").disabled = !past;
+  document.getElementById("day-today").hidden = !past;
+  for (const el of document.querySelectorAll("[data-today-only]")) el.hidden = past;
+}
+
+async function refreshPast(day, turn) {
+  const status = await api(`/api/status?day=${encodeURIComponent(day)}`);
+  // A slower answer for a day no longer on show is dropped
+  if (turn !== refreshes) return;
+  hideTip();
+  renderDayBar(status);
+  usersEl.innerHTML = status.users.length
+    ? status.users.map((u) => pastCardHtml(u, status.day)).join("")
+    : '<article class="card"><p class="empty-note">Nothing was recorded on this day or the six before it.</p></article>';
+  updatedEl.classList.remove("error");
+  updatedEl.textContent = `Showing ${dayLabel(status.day)}`;
+}
+
 async function refresh() {
+  const turn = ++refreshes;
   try {
+    if (viewDay) return await refreshPast(viewDay, turn);
     const [status, events, messages] = await Promise.all([api("/api/status"), api("/api/events"), api("/api/messages").catch(() => null)]);
+    if (turn !== refreshes) return;
+    renderDayBar(status);
     // Without the names the cards still render; the next refresh asks again
     if (!categories.length) categories = await api("/api/categories").catch(() => []);
     // Overrun apps come as ids; names are nice to have, so a failed fetch just shows ids
@@ -365,6 +454,7 @@ async function refresh() {
     updatedEl.classList.remove("error");
     updatedEl.textContent = `Updated ${new Date(status.generated_at * 1000).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`;
   } catch {
+    if (turn !== refreshes) return;
     updatedEl.classList.add("error");
     updatedEl.textContent = "Can't reach server";
   }

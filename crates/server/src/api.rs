@@ -46,7 +46,7 @@ impl From<Invalid> for ApiError {
     }
 }
 
-fn invalid(field: &'static str, message: &str) -> ApiError {
+pub(crate) fn invalid(field: &'static str, message: &str) -> ApiError {
     ApiError::Invalid(Invalid {
         field,
         message: message.into(),
@@ -741,6 +741,72 @@ mod tests {
         assert_eq!(user["sessions"][0]["apps"], json!(["Minecraft"]));
         // The day's total is time at the computer, whatever was running
         assert_eq!(user["today_secs"], 15);
+    }
+
+    /// Reports 15 counted seconds for `kid1` on `host-a`, `days_ago` days back.
+    async fn report_days_ago(app: &TestApp, days_ago: i64, seq: u64) {
+        let at = chrono::Local::now().timestamp() - days_ago * 86_400;
+        let body = json!({ "host": "host-a", "agent_id": "past", "interval_secs": 15, "samples": [{
+            "seq": seq, "at": at, "elapsed_secs": 15,
+            "users": [{ "user": "kid1", "state": "active", "apps": [{ "id": "steam:1", "name": "Some Game" }] }],
+        }]});
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/report")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer token")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        router(app.state.clone()).oneshot(request).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn status_for_a_past_day_shows_that_days_usage() {
+        let app = app("status-past-day");
+        // Noon two days ago can't be told apart from "today" near midnight, so go by the server's own days
+        report_days_ago(&app, 2, 1).await;
+        let today = chrono::Local::now().date_naive();
+        let past = (chrono::Local::now() - chrono::Duration::days(2)).date_naive();
+
+        let (code, status) = call(&app, "GET", &format!("/api/status?day={past}"), None).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(status["day"], past.to_string());
+        assert_eq!(status["today"], today.to_string());
+        let user = &status["users"][0];
+        assert_eq!(user["user"], "kid1");
+        assert_eq!(user["today_secs"], 15);
+        assert_eq!(user["apps_today"][0]["name"], "Some Game");
+        assert_eq!(user["hosts_today"][0]["name"], "host-a");
+        // The chart's seven days end on the day asked for
+        let days = user["days"].as_array().unwrap();
+        assert_eq!(days.len(), 7);
+        assert_eq!(days[6]["name"], past.to_string());
+        assert_eq!(days[6]["secs"], 15);
+        assert_eq!(user["week_secs"], 15);
+
+        // Without a day it is today, where nothing was used
+        let (_, status) = call(&app, "GET", "/api/status", None).await;
+        assert_eq!(status["day"], today.to_string());
+        let user = &status["users"][0];
+        assert_eq!(user["today_secs"], 0);
+        assert!(user["apps_today"].as_array().unwrap().is_empty());
+        assert_eq!(user["days"][6]["name"], today.to_string());
+
+        // A day with nothing recorded, long before the account existed, is an empty list
+        let (code, status) = call(&app, "GET", "/api/status?day=2020-01-01", None).await;
+        assert_eq!(code, StatusCode::OK);
+        assert!(status["users"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn status_refuses_a_day_that_is_malformed_or_in_the_future() {
+        let app = app("status-bad-day");
+        let tomorrow = (chrono::Local::now() + chrono::Duration::days(1)).date_naive();
+        for day in ["yesterday", "2026-13-01", "", &tomorrow.to_string()] {
+            let (code, body) = call(&app, "GET", &format!("/api/status?day={day}"), None).await;
+            assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "day={day}");
+            assert_eq!(body["field"], "day", "day={day}");
+        }
     }
 
     #[tokio::test]

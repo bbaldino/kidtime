@@ -56,7 +56,8 @@ A Cargo workspace (edition 2024) with three crates:
   - Reported names (account, host, app id, app name) are clipped to 200 characters, apps with an empty id
     are skipped, and at most 50 apps per user per sample are recorded.
   - A daily task deletes `app_activity` and `event` rows older than 30 days.
-- `GET /api/status` returns JSON for the dashboard:
+- `GET /api/status` returns JSON for the dashboard. `?day=YYYY-MM-DD` gives a past day's usage (and the
+  six days before it) instead of today's; a malformed or future day gets 422. The live parts are always current:
   - each user's headline state and the host it's on;
   - live sessions for each host (a host is treated as offline after 3× its interval without a report);
   - today's and the last 7 days' totals;
@@ -157,6 +158,8 @@ Agent config: see `deploy/agent.toml.example`. A streaming host sets `streaming_
 - Days are counted in the server's local time zone, so `TZ` for the container must match the kids' PCs.
 - The dashboard (`crates/server/static/`) is vanilla JS with no build step. It polls `/api/status` every 10s.
   It has three tabs: Today, Rules and Apps. The Rules and Apps tabs are in `manage.js`.
+  - The Today tab has a date bar (previous/next, date picker, Today), and a chart column jumps to its day.
+    A past day is read-only usage: no status, running apps, timer, message box or rules log.
   - Designed for phones first, with two columns on wide screens and separate light and dark colors.
   - Each kid gets a card: a status pill (icon plus label, never color alone), a big "today" number,
     "last 7 days", chips for what's running now, per-app bars (top 6 plus "N others"), a 7-day column chart

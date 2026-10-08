@@ -437,13 +437,13 @@ impl Db {
         Ok(report)
     }
 
-    /// Users with any usage since `since`.
-    pub fn users_since(&self, since: NaiveDate) -> Result<Vec<String>> {
+    /// Accounts with recorded time on any day in `from..=to`.
+    pub fn users_between(&self, from: NaiveDate, to: NaiveDate) -> Result<Vec<String>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT DISTINCT user FROM usage WHERE day >= ?1")?;
+            .prepare("SELECT DISTINCT user FROM usage WHERE day >= ?1 AND day <= ?2")?;
         let users = stmt
-            .query_map([since.to_string()], |r| r.get(0))?
+            .query_map([from.to_string(), to.to_string()], |r| r.get(0))?
             .collect::<Result<_, _>>()?;
         Ok(users)
     }
