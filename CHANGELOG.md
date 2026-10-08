@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.9.0](https://github.com/bbaldino/kidtime/compare/v0.8.0...v0.9.0) (2026-10-08)
+
+
+### Features
+
+* **dashboard:** show the timeline as one numbered strip with a key ([770531c](https://github.com/bbaldino/kidtime/commit/770531c81828fcebfd1b2baf478ef71350188729))
+* **dashboard:** timeline of which app was in use when ([6f08a9e](https://github.com/bbaldino/kidtime/commit/6f08a9e1412c5c6d3d7ba8a349b02df7aafef02f))
+
 ## [0.8.0](https://github.com/bbaldino/kidtime/compare/v0.7.0...v0.8.0) (2026-10-08)
 
 
